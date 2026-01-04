@@ -6,31 +6,30 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : [];
+
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
+    // Allow server-to-server, curl, Postman
     if (!origin) return callback(null, true);
-    
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'http://localhost:3001',
-     // Add your deployed frontend URL
-      'https://cheery-cobbler-7cefa9.netlify.app/', // Add your deployed frontend URL
-      // Add more allowed origins as needed
-    ];
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+
+    console.error('❌ Blocked by CORS:', origin);
+    return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id'],
   optionsSuccessStatus: 200
 };
 
-// Middleware
 app.use(cors(corsOptions));
+
 
 // Middleware
 
