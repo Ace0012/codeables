@@ -35,28 +35,24 @@ app.use((req, res, next) => {
 });
 
 // ========================================
-// 🔐 PHASE 2: MULTI-ACCOUNT DATA STRUCTURES
+// 🔐 DATA STRUCTURES
 // ========================================
 
-// User sessions (existing)
+// User sessions
 const userSessions = new Map();
 
-// NEW: Account storage
-// Structure: Map<accountToken, accountData>
+// PHASE 2: Multi-account system
 const deltaAccounts = new Map();
-
-// NEW: Strategy tracking
-// Structure: Map<accountToken, Map<strategyTag, strategyData>>
 const accountStrategies = new Map();
-
-// NEW: Position tracking
-// Structure: Map<positionKey, positionData>
-// positionKey = `${accountToken}:${strategyTag}:${symbol}:${side}`
 const strategyPositions = new Map();
-
-// NEW: Order tracking
-// Structure: Map<orderId, orderMetadata>
 const orderMetadata = new Map();
+
+// PHASE 3: Signal Provider System
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
+const ADMIN_SESSION_ID = 'ADMIN_MASTER_SESSION';
+const masterSignals = new Map();
+const userSubscriptions = new Map();
+const signalExecutions = new Map();
 
 // ========================================
 // 🔧 UTILITY FUNCTIONS
@@ -86,7 +82,7 @@ function getAuthHeaders(method, endpoint, queryString = '', payload = '', apiKey
     'timestamp': timestamp,
     'signature': signature,
     'Content-Type': 'application/json',
-    'User-Agent': 'delta-trading-bridge-v2'
+    'User-Agent': 'delta-trading-bridge-v3'
   };
 }
 
@@ -110,16 +106,29 @@ function validateSession(req, res, next) {
   next();
 }
 
-// NEW: Generate unique account token
 function generateAccountToken() {
   const prefix = 'ACC';
   const randomPart = crypto.randomBytes(4).toString('hex').toUpperCase();
   return `${prefix}_${randomPart}`;
 }
 
-// NEW: Generate position key
 function getPositionKey(accountToken, strategyTag, symbol, side) {
   return `${accountToken}:${strategyTag}:${symbol}:${side}`;
+}
+
+function generateSignalId() {
+  const prefix = 'SIG';
+  const timestamp = Date.now().toString(36).toUpperCase();
+  const random = crypto.randomBytes(3).toString('hex').toUpperCase();
+  return `${prefix}_${timestamp}_${random}`;
+}
+
+function isAdmin(req) {
+  const sessionId = req.headers['x-session-id'];
+  const session = userSessions.get(sessionId);
+  
+  return sessionId === ADMIN_SESSION_ID || 
+         (session && session.apiKey === ADMIN_API_KEY);
 }
 
 // ========================================
@@ -134,12 +143,14 @@ app.get('/api/health', (req, res) => {
     activeSessions: userSessions.size,
     totalAccounts: deltaAccounts.size,
     totalStrategies: Array.from(accountStrategies.values()).reduce((sum, map) => sum + map.size, 0),
-    activePositions: strategyPositions.size
+    activePositions: strategyPositions.size,
+    totalSignals: masterSignals.size,
+    totalSubscribers: userSubscriptions.size
   });
 });
 
 // ========================================
-// 🔐 AUTHENTICATION ENDPOINTS (EXISTING)
+// 🔐 AUTHENTICATION
 // ========================================
 
 app.post('/api/auth/login', async (req, res) => {
@@ -181,17 +192,23 @@ app.post('/api/auth/login', async (req, res) => {
     if (response.status === 200 && response.data.success) {
       const sessionId = crypto.randomBytes(32).toString('hex');
       
+      const isAdminUser = apiKey === ADMIN_API_KEY;
+      
       userSessions.set(sessionId, {
         apiKey,
         apiSecret,
         accountType,
         baseUrl,
         userInfo: response.data.result,
+        isAdmin: isAdminUser,
         createdAt: new Date(),
         lastActivity: new Date()
       });
 
       console.log(`✅ Login successful for user: ${response.data.result.email}`);
+      if (isAdminUser) {
+        console.log('👑 ADMIN USER LOGGED IN');
+      }
 
       res.json({
         success: true,
@@ -200,7 +217,8 @@ app.post('/api/auth/login', async (req, res) => {
           email: response.data.result.email,
           accountName: response.data.result.account_name,
           accountType,
-          marginMode: response.data.result.margin_mode
+          marginMode: response.data.result.margin_mode,
+          isAdmin: isAdminUser
         }
       });
     } else {
@@ -249,16 +267,16 @@ app.get('/api/auth/validate', validateSession, (req, res) => {
       email: req.userSession.userInfo.email,
       accountName: req.userSession.userInfo.account_name,
       accountType: req.userSession.accountType,
-      marginMode: req.userSession.userInfo.margin_mode
+      marginMode: req.userSession.userInfo.margin_mode,
+      isAdmin: req.userSession.isAdmin || false
     }
   });
 });
 
 // ========================================
-// 🏦 PHASE 2: ACCOUNT MANAGEMENT ENDPOINTS
+// 🏦 ACCOUNT MANAGEMENT
 // ========================================
 
-// Add new Delta Exchange account
 app.post('/api/accounts/add', validateSession, async (req, res) => {
   try {
     const { apiKey, apiSecret, accountType, accountLabel, ipAddress } = req.body;
@@ -273,7 +291,6 @@ app.post('/api/accounts/add', validateSession, async (req, res) => {
       });
     }
 
-    // Validate credentials
     const baseUrl = getBaseUrl(accountType);
     const endpoint = '/v2/profile';
     const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
@@ -296,10 +313,8 @@ app.post('/api/accounts/add', validateSession, async (req, res) => {
       });
     }
 
-    // Generate unique account token
     const accountToken = generateAccountToken();
 
-    // Store account data
     const accountData = {
       accountToken,
       apiKey,
@@ -319,8 +334,6 @@ app.post('/api/accounts/add', validateSession, async (req, res) => {
     accountStrategies.set(accountToken, new Map());
 
     console.log(`✅ Account added successfully: ${accountToken}`);
-    console.log(`   Label: ${accountData.accountLabel}`);
-    console.log(`   Email: ${accountData.userEmail}`);
 
     res.json({
       success: true,
@@ -345,7 +358,6 @@ app.post('/api/accounts/add', validateSession, async (req, res) => {
   }
 });
 
-// Get all accounts for current user
 app.get('/api/accounts', validateSession, (req, res) => {
   try {
     const sessionId = req.headers['x-session-id'];
@@ -379,7 +391,6 @@ app.get('/api/accounts', validateSession, (req, res) => {
   }
 });
 
-// Delete account
 app.delete('/api/accounts/:accountToken', validateSession, (req, res) => {
   try {
     const { accountToken } = req.params;
@@ -401,11 +412,9 @@ app.delete('/api/accounts/:accountToken', validateSession, (req, res) => {
       });
     }
 
-    // Clean up all related data
     deltaAccounts.delete(accountToken);
     accountStrategies.delete(accountToken);
     
-    // Remove all positions for this account
     for (const [key, pos] of strategyPositions.entries()) {
       if (pos.accountToken === accountToken) {
         strategyPositions.delete(key);
@@ -428,8 +437,127 @@ app.delete('/api/accounts/:accountToken', validateSession, (req, res) => {
   }
 });
 
+app.get('/api/accounts/:accountToken/strategies', validateSession, (req, res) => {
+  try {
+    const { accountToken } = req.params;
+
+    const account = deltaAccounts.get(accountToken);
+    if (!account) {
+      return res.status(404).json({
+        success: false,
+        error: 'Account not found'
+      });
+    }
+
+    const strategies = accountStrategies.get(accountToken);
+    const strategyList = Array.from(strategies.values()).map(s => ({
+      strategyTag: s.strategyTag,
+      symbols: Array.from(s.symbols),
+      totalOrders: s.totalOrders,
+      createdAt: s.createdAt,
+      lastActivity: s.lastActivity
+    }));
+
+    res.json({
+      success: true,
+      accountToken,
+      accountLabel: account.accountLabel,
+      strategies: strategyList,
+      totalStrategies: strategyList.length
+    });
+  } catch (error) {
+    console.error('❌ Error fetching strategies:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/accounts/:accountToken/positions', validateSession, (req, res) => {
+  try {
+    const { accountToken } = req.params;
+    const { strategy_tag } = req.query;
+
+    const account = deltaAccounts.get(accountToken);
+    if (!account) {
+      return res.status(404).json({
+        success: false,
+        error: 'Account not found'
+      });
+    }
+
+    let positions = Array.from(strategyPositions.values())
+      .filter(pos => pos.accountToken === accountToken);
+
+    if (strategy_tag) {
+      positions = positions.filter(pos => pos.strategyTag === strategy_tag);
+    }
+
+    const positionList = positions.map(pos => ({
+      strategyTag: pos.strategyTag,
+      symbol: pos.symbol,
+      side: pos.side,
+      size: pos.size,
+      orderIds: pos.orderIds,
+      createdAt: pos.createdAt,
+      lastUpdated: pos.lastUpdated
+    }));
+
+    res.json({
+      success: true,
+      accountToken,
+      accountLabel: account.accountLabel,
+      positions: positionList,
+      totalPositions: positionList.length
+    });
+  } catch (error) {
+    console.error('❌ Error fetching positions:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/stats', validateSession, (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    
+    const userAccounts = Array.from(deltaAccounts.values())
+      .filter(acc => acc.addedBy === sessionId);
+
+    const totalStrategies = userAccounts.reduce((sum, acc) => {
+      return sum + (accountStrategies.get(acc.accountToken)?.size || 0);
+    }, 0);
+
+    const totalPositions = Array.from(strategyPositions.values())
+      .filter(pos => userAccounts.some(acc => acc.accountToken === pos.accountToken))
+      .length;
+
+    res.json({
+      success: true,
+      stats: {
+        totalAccounts: userAccounts.length,
+        totalStrategies,
+        totalPositions,
+        totalOrders: orderMetadata.size
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching stats:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ========================================
-// 📡 PHASE 2: TRADINGVIEW WEBHOOK ENDPOINT
+// 📡 TRADINGVIEW WEBHOOK
 // ========================================
 
 app.post('/api/webhook/tradingview', async (req, res) => {
@@ -439,7 +567,6 @@ app.post('/api/webhook/tradingview', async (req, res) => {
     console.log('📡 TradingView Webhook Received:');
     console.log(JSON.stringify(payload, null, 2));
 
-    // Validate required fields
     const { account_token, strategy_tag, signal, symbol, quantity } = payload;
 
     if (!account_token || !strategy_tag || !signal || !symbol) {
@@ -449,7 +576,6 @@ app.post('/api/webhook/tradingview', async (req, res) => {
       });
     }
 
-    // Validate account token
     const account = deltaAccounts.get(account_token);
     if (!account) {
       console.error(`❌ Invalid account token: ${account_token}`);
@@ -461,18 +587,14 @@ app.post('/api/webhook/tradingview', async (req, res) => {
 
     console.log(`✅ Account validated: ${account.accountLabel}`);
 
-    // Update last used timestamp
     account.lastUsed = new Date();
 
-    // Normalize signal
     const normalizedSignal = signal.toUpperCase();
 
-    // Handle EXIT signal
     if (normalizedSignal === 'EXIT' || normalizedSignal === 'CLOSE') {
       return await handleExitSignal(account_token, strategy_tag, symbol, res);
     }
 
-    // Handle BUY/SELL signal
     if (normalizedSignal === 'BUY' || normalizedSignal === 'SELL') {
       return await handleTradeSignal(account_token, strategy_tag, normalizedSignal, symbol, quantity, account, res);
     }
@@ -492,17 +614,10 @@ app.post('/api/webhook/tradingview', async (req, res) => {
   }
 });
 
-// ========================================
-// 🔄 SIGNAL HANDLERS
-// ========================================
-
 async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quantity, account, res) {
   try {
     console.log(`🔄 Processing ${signal} signal for ${symbol}`);
-    console.log(`   Account: ${account.accountLabel}`);
-    console.log(`   Strategy: ${strategyTag}`);
 
-    // Get product ID for symbol
     const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 10000
@@ -517,11 +632,9 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
       });
     }
 
-    // Determine order size
     let orderSize = quantity ? parseInt(quantity) : 1;
     if (orderSize <= 0) orderSize = 1;
 
-    // Place order
     const orderPayload = {
       product_id: product.id,
       side: signal.toLowerCase(),
@@ -548,7 +661,6 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
     if (orderResponse.status === 200 && orderResponse.data.success) {
       const order = orderResponse.data.result;
       
-      // Store order metadata
       orderMetadata.set(order.id, {
         accountToken,
         strategyTag,
@@ -559,17 +671,14 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
         timestamp: new Date()
       });
 
-      // Track position
       const positionKey = getPositionKey(accountToken, strategyTag, symbol, signal.toLowerCase());
       
       if (strategyPositions.has(positionKey)) {
-        // Update existing position
         const existingPos = strategyPositions.get(positionKey);
         existingPos.size += orderSize;
         existingPos.orderIds.push(order.id);
         existingPos.lastUpdated = new Date();
       } else {
-        // Create new position
         strategyPositions.set(positionKey, {
           accountToken,
           strategyTag,
@@ -582,7 +691,6 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
         });
       }
 
-      // Track strategy
       if (!accountStrategies.get(accountToken).has(strategyTag)) {
         accountStrategies.get(accountToken).set(strategyTag, {
           strategyTag,
@@ -599,7 +707,6 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
       }
 
       console.log(`✅ Order placed successfully: ${order.id}`);
-      console.log(`   Position Key: ${positionKey}`);
 
       return res.json({
         success: true,
@@ -635,13 +742,9 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
 async function handleExitSignal(accountToken, strategyTag, symbol, res) {
   try {
     console.log(`🚪 Processing EXIT signal`);
-    console.log(`   Account Token: ${accountToken}`);
-    console.log(`   Strategy Tag: ${strategyTag}`);
-    console.log(`   Symbol: ${symbol}`);
 
     const account = deltaAccounts.get(accountToken);
 
-    // Find matching positions
     const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
     const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
 
@@ -661,10 +764,7 @@ async function handleExitSignal(accountToken, strategyTag, symbol, res) {
 
     const closedPositions = [];
 
-    // Close buy position
     if (buyPosition) {
-      console.log(`   Closing BUY position: ${buyPosition.size} contracts`);
-      
       const closePayload = {
         product_id: await getProductId(symbol, account.baseUrl),
         side: 'sell',
@@ -680,10 +780,7 @@ async function handleExitSignal(accountToken, strategyTag, symbol, res) {
       }
     }
 
-    // Close sell position
     if (sellPosition) {
-      console.log(`   Closing SELL position: ${sellPosition.size} contracts`);
-      
       const closePayload = {
         product_id: await getProductId(symbol, account.baseUrl),
         side: 'buy',
@@ -750,38 +847,531 @@ async function executeCloseOrder(orderPayload, account) {
 }
 
 // ========================================
-// 📊 MONITORING ENDPOINTS
+// 🎯 PHASE 3: SIGNAL PROVIDER SYSTEM
 // ========================================
 
-// Get all strategies for an account
-app.get('/api/accounts/:accountToken/strategies', validateSession, (req, res) => {
+// ADMIN: CREATE SIGNAL
+app.post('/api/admin/signals/create', validateSession, async (req, res) => {
   try {
-    const { accountToken } = req.params;
-
-    const account = deltaAccounts.get(accountToken);
-    if (!account) {
-      return res.status(404).json({
+    if (!isAdmin(req)) {
+      return res.status(403).json({
         success: false,
-        error: 'Account not found'
+        error: 'Unauthorized: Only signal provider can create signals'
       });
     }
 
-    const strategies = accountStrategies.get(accountToken);
-    const strategyList = Array.from(strategies.values()).map(s => ({
-      strategyTag: s.strategyTag,
-      symbols: Array.from(s.symbols),
-      totalOrders: s.totalOrders,
-      createdAt: s.createdAt,
-      lastActivity: s.lastActivity
-    }));
+    const {
+      signal_type,
+      symbol,
+      quantity,
+      strategy_name,
+      description,
+      target_price,
+      stop_loss,
+      auto_execute
+    } = req.body;
+
+    console.log('🎯 ADMIN CREATING SIGNAL...');
+    console.log(`   Type: ${signal_type}`);
+    console.log(`   Symbol: ${symbol}`);
+    console.log(`   Strategy: ${strategy_name}`);
+
+    if (!signal_type || !symbol || !strategy_name) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: signal_type, symbol, strategy_name'
+      });
+    }
+
+    const signalId = generateSignalId();
+    
+    const signal = {
+      signalId,
+      signal_type: signal_type.toUpperCase(),
+      symbol,
+      quantity: quantity || 1,
+      strategy_name,
+      description: description || '',
+      target_price: target_price || null,
+      stop_loss: stop_loss || null,
+      auto_execute: auto_execute !== false,
+      status: 'active',
+      created_at: new Date(),
+      created_by: 'ADMIN',
+      execution_count: 0,
+      success_count: 0,
+      failure_count: 0
+    };
+
+    masterSignals.set(signalId, signal);
+    signalExecutions.set(signalId, new Map());
+
+    console.log(`✅ SIGNAL STORED IN DATABASE: ${signalId}`);
+
+    if (signal.auto_execute) {
+      console.log('📢 BROADCASTING TO ALL SUBSCRIBERS...');
+      await broadcastSignalToAllUsers(signal);
+    }
 
     res.json({
       success: true,
-      accountToken,
-      accountLabel: account.accountLabel,
-      strategies: strategyList,
-      totalStrategies: strategyList.length
+      message: 'Signal created and broadcasted to all subscribers',
+      signal: {
+        signalId: signal.signalId,
+        signal_type: signal.signal_type,
+        symbol: signal.symbol,
+        quantity: signal.quantity,
+        strategy_name: signal.strategy_name,
+        description: signal.description,
+        auto_execute: signal.auto_execute,
+        created_at: signal.created_at,
+        execution_count: signal.execution_count,
+        success_count: signal.success_count,
+        failure_count: signal.failure_count
+      }
     });
+
+  } catch (error) {
+    console.error('❌ Error creating signal:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// BROADCAST TO ALL SUBSCRIBERS
+async function broadcastSignalToAllUsers(signal) {
+  console.log(`📢 BROADCASTING SIGNAL: ${signal.signalId}`);
+  console.log(`   Strategy: ${signal.strategy_name}`);
+  console.log(`   Signal: ${signal.signal_type} ${signal.symbol}`);
+
+  const subscribedUsers = Array.from(userSubscriptions.entries())
+    .filter(([sessionId, sub]) => 
+      sub.enabled && 
+      sub.strategies.includes(signal.strategy_name)
+    );
+
+  console.log(`   📊 Found ${subscribedUsers.length} subscribed users`);
+
+  if (subscribedUsers.length === 0) {
+    console.log('   ⚠️ No subscribers found for this strategy');
+    return;
+  }
+
+  for (const [sessionId, subscription] of subscribedUsers) {
+    try {
+      const userSession = userSessions.get(sessionId);
+      
+      if (!userSession) {
+        console.log(`   ⚠️ User session not found: ${sessionId}`);
+        continue;
+      }
+
+      console.log(`   📤 Executing for user: ${userSession.userInfo.email}`);
+
+      const result = await executeSignalOnUserAccount(signal, userSession);
+
+      signalExecutions.get(signal.signalId).set(sessionId, {
+        sessionId,
+        userEmail: userSession.userInfo.email,
+        success: result.success,
+        orderId: result.orderId || null,
+        error: result.error || null,
+        executed_at: new Date()
+      });
+
+      if (result.success) {
+        signal.success_count++;
+        console.log(`   ✅ SUCCESS for ${userSession.userInfo.email}`);
+      } else {
+        signal.failure_count++;
+        console.log(`   ❌ FAILED for ${userSession.userInfo.email}: ${result.error}`);
+      }
+
+      signal.execution_count++;
+
+    } catch (error) {
+      console.error(`   ❌ Error executing for user ${sessionId}:`, error.message);
+      signal.failure_count++;
+      signal.execution_count++;
+    }
+  }
+
+  console.log(`📢 BROADCAST COMPLETE:`);
+  console.log(`   ✅ Success: ${signal.success_count}`);
+  console.log(`   ❌ Failed: ${signal.failure_count}`);
+  console.log(`   📊 Total: ${signal.execution_count}`);
+}
+
+// EXECUTE SIGNAL ON USER ACCOUNT
+async function executeSignalOnUserAccount(signal, userSession) {
+  try {
+    const { apiKey, apiSecret, baseUrl } = userSession;
+
+    const productsResponse = await axios.get(`${baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    const product = productsResponse.data.result.find(p => p.symbol === signal.symbol);
+    
+    if (!product) {
+      return {
+        success: false,
+        error: `Symbol ${signal.symbol} not found`
+      };
+    }
+
+    if (signal.signal_type === 'EXIT') {
+      const closePayload = {
+        product_id: product.id
+      };
+
+      const payload = JSON.stringify(closePayload);
+      const endpoint = '/v2/positions/close_all';
+      const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
+
+      const response = await axios.post(
+        `${baseUrl}${endpoint}`,
+        closePayload,
+        { 
+          headers, 
+          timeout: 10000,
+          validateStatus: function (status) {
+            return status < 500;
+          }
+        }
+      );
+
+      return {
+        success: response.data.success,
+        orderId: null,
+        message: 'Position closed'
+      };
+    }
+
+    const orderPayload = {
+      product_id: product.id,
+      side: signal.signal_type.toLowerCase(),
+      order_type: 'market_order',
+      size: signal.quantity
+    };
+
+    const payload = JSON.stringify(orderPayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
+
+    const response = await axios.post(
+      `${baseUrl}${endpoint}`,
+      orderPayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (response.status === 200 && response.data.success) {
+      return {
+        success: true,
+        orderId: response.data.result.id,
+        message: 'Order placed successfully'
+      };
+    } else {
+      return {
+        success: false,
+        error: response.data.error?.message || 'Order placement failed'
+      };
+    }
+
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+// USER: SUBSCRIBE TO SIGNALS
+app.post('/api/signals/subscribe', validateSession, (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    const { strategies, enabled } = req.body;
+
+    console.log(`👥 USER SUBSCRIBING TO SIGNALS...`);
+    console.log(`   User: ${req.userSession.userInfo.email}`);
+    console.log(`   Strategies: ${strategies}`);
+
+    if (!strategies || !Array.isArray(strategies)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Strategies array is required'
+      });
+    }
+
+    userSubscriptions.set(sessionId, {
+      sessionId,
+      userEmail: req.userSession.userInfo.email,
+      strategies: strategies,
+      enabled: enabled !== false,
+      subscribed_at: userSubscriptions.has(sessionId) 
+        ? userSubscriptions.get(sessionId).subscribed_at 
+        : new Date(),
+      updated_at: new Date()
+    });
+
+    console.log(`✅ Subscription updated for ${req.userSession.userInfo.email}`);
+
+    res.json({
+      success: true,
+      subscription: {
+        strategies: strategies,
+        enabled: enabled !== false,
+        message: 'Successfully subscribed to signal provider strategies'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error subscribing:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// USER: GET ALL SIGNALS
+app.get('/api/signals', validateSession, (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    const { strategy_name, status } = req.query;
+
+    let signals = Array.from(masterSignals.values());
+
+    if (strategy_name) {
+      signals = signals.filter(s => s.strategy_name === strategy_name);
+    }
+
+    if (status) {
+      signals = signals.filter(s => s.status === status);
+    }
+
+    const subscription = userSubscriptions.get(sessionId);
+
+    const signalsWithStatus = signals.map(signal => {
+      const execution = signalExecutions.get(signal.signalId)?.get(sessionId);
+      
+      return {
+        signalId: signal.signalId,
+        signal_type: signal.signal_type,
+        symbol: signal.symbol,
+        quantity: signal.quantity,
+        strategy_name: signal.strategy_name,
+        description: signal.description,
+        target_price: signal.target_price,
+        stop_loss: signal.stop_loss,
+        status: signal.status,
+        created_at: signal.created_at,
+        execution_count: signal.execution_count,
+        success_count: signal.success_count,
+        failure_count: signal.failure_count,
+        success_rate: signal.execution_count > 0 
+          ? ((signal.success_count / signal.execution_count) * 100).toFixed(2) 
+          : 0,
+        user_execution: execution ? {
+          executed: true,
+          success: execution.success,
+          orderId: execution.orderId,
+          error: execution.error,
+          executed_at: execution.executed_at
+        } : {
+          executed: false
+        },
+        subscribed: subscription?.strategies.includes(signal.strategy_name) || false
+      };
+    });
+
+    res.json({
+      success: true,
+      signals: signalsWithStatus,
+      totalSignals: signalsWithStatus.length,
+      subscription: subscription ? {
+        enabled: subscription.enabled,
+        strategies: subscription.strategies,
+        subscribed_at: subscription.subscribed_at
+      } : null
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching signals:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ADMIN: GET ALL SIGNALS
+app.get('/api/admin/signals', validateSession, (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized: Admin access required'
+      });
+    }
+
+    const signals = Array.from(masterSignals.values()).map(signal => {
+      const executions = Array.from(signalExecutions.get(signal.signalId)?.values() || []);
+      
+      return {
+        signalId: signal.signalId,
+        signal_type: signal.signal_type,
+        symbol: signal.symbol,
+        quantity: signal.quantity,
+        strategy_name: signal.strategy_name,
+        description: signal.description,
+        target_price: signal.target_price,
+        stop_loss: signal.stop_loss,
+        status: signal.status,
+        created_at: signal.created_at,
+        execution_count: signal.execution_count,
+        success_count: signal.success_count,
+        failure_count: signal.failure_count,
+        success_rate: signal.execution_count > 0 
+          ? ((signal.success_count / signal.execution_count) * 100).toFixed(2) 
+          : 0,
+        executions: executions.map(exec => ({
+          userEmail: exec.userEmail,
+          success: exec.success,
+          orderId: exec.orderId,
+          error: exec.error,
+          executed_at: exec.executed_at
+        }))
+      };
+    });
+
+    const totalSubscribers = userSubscriptions.size;
+    const activeSubscribers = Array.from(userSubscriptions.values())
+      .filter(sub => sub.enabled).length;
+
+    res.json({
+      success: true,
+      signals,
+      totalSignals: signals.length,
+      statistics: {
+        totalSubscribers,
+        activeSubscribers,
+        totalSignals: signals.length,
+        activeSignals: signals.filter(s => s.status === 'active').length
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching admin signals:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ADMIN: DELETE SIGNAL
+app.delete('/api/admin/signals/:signalId', validateSession, (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized: Admin access required'
+      });
+    }
+
+    const { signalId } = req.params;
+
+    if (!masterSignals.has(signalId)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Signal not found'
+      });
+    }
+
+    const signal = masterSignals.get(signalId);
+    
+    masterSignals.delete(signalId);
+    signalExecutions.delete(signalId);
+
+    console.log(`🗑️ Signal deleted: ${signalId}`);
+
+    res.json({
+      success: true,
+      message: 'Signal deleted successfully',
+      deletedSignal: {
+        signalId: signal.signalId,
+        strategy_name: signal.strategy_name,
+        signal_type: signal.signal_type,
+        symbol: signal.symbol
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error deleting signal:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// GET AVAILABLE STRATEGIES
+app.get('/api/strategies/available', validateSession, (req, res) => {
+  try {
+    const strategies = [...new Set(
+      Array.from(masterSignals.values()).map(s => s.strategy_name)
+    )];
+
+    const strategyStats = strategies.map(strategyName => {
+      const signals = Array.from(masterSignals.values())
+        .filter(s => s.strategy_name === strategyName);
+
+      const totalSignals = signals.length;
+      const activeSignals = signals.filter(s => s.status === 'active').length;
+      const totalExecutions = signals.reduce((sum, s) => sum + s.execution_count, 0);
+      const totalSuccess = signals.reduce((sum, s) => sum + s.success_count, 0);
+      const successRate = totalExecutions > 0
+        ? ((totalSuccess / totalExecutions) * 100).toFixed(2)
+        : 0;
+
+      const subscriberCount = Array.from(userSubscriptions.values())
+        .filter(sub => sub.enabled && sub.strategies.includes(strategyName))
+        .length;
+
+      return {
+        strategy_name: strategyName,
+        totalSignals,
+        activeSignals,
+        totalExecutions,
+        successRate: parseFloat(successRate),
+        subscriberCount,
+        latestSignal: signals.length > 0 
+          ? signals[signals.length - 1].created_at 
+          : null
+      };
+    });
+
+    res.json({
+      success: true,
+      strategies: strategyStats,
+      totalStrategies: strategies.length
+    });
+
   } catch (error) {
     console.error('❌ Error fetching strategies:', error.message);
     
@@ -792,46 +1382,33 @@ app.get('/api/accounts/:accountToken/strategies', validateSession, (req, res) =>
   }
 });
 
-// Get all positions for an account
-app.get('/api/accounts/:accountToken/positions', validateSession, (req, res) => {
+// ADMIN: GET SUBSCRIBERS
+app.get('/api/admin/subscribers', validateSession, (req, res) => {
   try {
-    const { accountToken } = req.params;
-    const { strategy_tag } = req.query;
-
-    const account = deltaAccounts.get(accountToken);
-    if (!account) {
-      return res.status(404).json({
+    if (!isAdmin(req)) {
+      return res.status(403).json({
         success: false,
-        error: 'Account not found'
+        error: 'Unauthorized: Admin access required'
       });
     }
 
-    let positions = Array.from(strategyPositions.values())
-      .filter(pos => pos.accountToken === accountToken);
-
-    if (strategy_tag) {
-      positions = positions.filter(pos => pos.strategyTag === strategy_tag);
-    }
-
-    const positionList = positions.map(pos => ({
-      strategyTag: pos.strategyTag,
-      symbol: pos.symbol,
-      side: pos.side,
-      size: pos.size,
-      orderIds: pos.orderIds,
-      createdAt: pos.createdAt,
-      lastUpdated: pos.lastUpdated
+    const subscribers = Array.from(userSubscriptions.values()).map(sub => ({
+      userEmail: sub.userEmail,
+      strategies: sub.strategies,
+      enabled: sub.enabled,
+      subscribed_at: sub.subscribed_at,
+      updated_at: sub.updated_at
     }));
 
     res.json({
       success: true,
-      accountToken,
-      accountLabel: account.accountLabel,
-      positions: positionList,
-      totalPositions: positionList.length
+      subscribers,
+      totalSubscribers: subscribers.length,
+      activeSubscribers: subscribers.filter(s => s.enabled).length
     });
+
   } catch (error) {
-    console.error('❌ Error fetching positions:', error.message);
+    console.error('❌ Error fetching subscribers:', error.message);
     
     res.status(500).json({
       success: false,
@@ -840,33 +1417,48 @@ app.get('/api/accounts/:accountToken/positions', validateSession, (req, res) => 
   }
 });
 
-// Get system statistics
-app.get('/api/stats', validateSession, (req, res) => {
+// ADMIN: MANUALLY BROADCAST SIGNAL
+app.post('/api/admin/signals/:signalId/broadcast', validateSession, async (req, res) => {
   try {
-    const sessionId = req.headers['x-session-id'];
-    
-    const userAccounts = Array.from(deltaAccounts.values())
-      .filter(acc => acc.addedBy === sessionId);
+    if (!isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized: Admin access required'
+      });
+    }
 
-    const totalStrategies = userAccounts.reduce((sum, acc) => {
-      return sum + (accountStrategies.get(acc.accountToken)?.size || 0);
-    }, 0);
+    const { signalId } = req.params;
 
-    const totalPositions = Array.from(strategyPositions.values())
-      .filter(pos => userAccounts.some(acc => acc.accountToken === pos.accountToken))
-      .length;
+    if (!masterSignals.has(signalId)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Signal not found'
+      });
+    }
+
+    const signal = masterSignals.get(signalId);
+
+    console.log(`🔄 MANUALLY BROADCASTING SIGNAL: ${signalId}`);
+
+    signal.execution_count = 0;
+    signal.success_count = 0;
+    signal.failure_count = 0;
+
+    await broadcastSignalToAllUsers(signal);
 
     res.json({
       success: true,
-      stats: {
-        totalAccounts: userAccounts.length,
-        totalStrategies,
-        totalPositions,
-        totalOrders: orderMetadata.size
+      message: 'Signal broadcasted successfully',
+      signal: {
+        signalId: signal.signalId,
+        execution_count: signal.execution_count,
+        success_count: signal.success_count,
+        failure_count: signal.failure_count
       }
     });
+
   } catch (error) {
-    console.error('❌ Error fetching stats:', error.message);
+    console.error('❌ Error broadcasting signal:', error.message);
     
     res.status(500).json({
       success: false,
@@ -876,7 +1468,7 @@ app.get('/api/stats', validateSession, (req, res) => {
 });
 
 // ========================================
-// 📜 EXISTING ENDPOINTS (PHASE 1)
+// 📜 TRADING ENDPOINTS
 // ========================================
 
 app.get('/api/symbols', validateSession, async (req, res) => {
@@ -1233,13 +1825,17 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log('='.repeat(70));
-  console.log('🚀 Delta Trading Bridge - PHASE 2: MULTI-ACCOUNT SYSTEM');
+  console.log('🚀 Delta Trading Bridge - PHASE 3: SIGNAL PROVIDER SYSTEM');
   console.log('='.repeat(70));
   console.log(`📡 Server running on: http://localhost:${PORT}`);
   console.log(`🔐 Session-based authentication enabled`);
   console.log(`🏦 Multi-account support with token-based routing`);
   console.log(`🏷️  Strategy-level isolation and tracking`);
+  console.log(`🎯 Signal Provider System: Broadcast to all subscribers`);
   console.log(`📊 TradingView webhook endpoint: /api/webhook/tradingview`);
+  console.log('='.repeat(70));
+  console.log(`👤 Admin API Key: ${ADMIN_API_KEY ? '✅ Configured' : '❌ Not Set'}`);
+  console.log(`📢 Signal Broadcasting: ${ADMIN_API_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log('='.repeat(70));
   console.log('');
 });
