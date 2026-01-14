@@ -132,6 +132,78 @@ function isAdmin(req) {
 }
 
 // ========================================
+// 🛠️ HELPER FUNCTIONS FOR WEBHOOKS
+// ========================================
+
+async function getProductBySymbol(symbol, baseUrl) {
+  try {
+    const response = await axios.get(`${baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    return response.data.result.find(p => p.symbol === symbol);
+  } catch (error) {
+    console.error('❌ Error fetching product:', error.message);
+    return null;
+  }
+}
+
+async function placeOrder(orderPayload, account) {
+  try {
+    const payload = JSON.stringify(orderPayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+    const response = await axios.post(
+      `${account.baseUrl}${endpoint}`,
+      orderPayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (response.status === 200 && response.data.success) {
+      return {
+        success: true,
+        order: response.data.result
+      };
+    } else {
+      return {
+        success: false,
+        error: response.data.error?.message || 'Order placement failed'
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+function updateStrategyTracking(accountToken, strategyTag, symbol) {
+  if (!accountStrategies.get(accountToken).has(strategyTag)) {
+    accountStrategies.get(accountToken).set(strategyTag, {
+      strategyTag,
+      symbols: new Set([symbol]),
+      totalOrders: 1,
+      createdAt: new Date(),
+      lastActivity: new Date()
+    });
+  } else {
+    const strategy = accountStrategies.get(accountToken).get(strategyTag);
+    strategy.symbols.add(symbol);
+    strategy.totalOrders += 1;
+    strategy.lastActivity = new Date();
+  }
+}
+
+// ========================================
 // 🏥 HEALTH CHECK
 // ========================================
 
@@ -556,1735 +628,6 @@ app.get('/api/stats', validateSession, (req, res) => {
   }
 });
 
-// ========================================
-// 📡 TRADINGVIEW WEBHOOK
-// ========================================
-
-app.post('/api/webhook/tradingview', async (req, res) => {
-  try {
-    const payload = req.body;
-    
-    console.log('📡 TradingView Webhook Received:');
-    console.log(JSON.stringify(payload, null, 2));
-
-    const { account_token, strategy_tag, signal, symbol, quantity } = payload;
-
-    if (!account_token || !strategy_tag || !signal || !symbol) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: account_token, strategy_tag, signal, symbol'
-      });
-    }
-
-    const account = deltaAccounts.get(account_token);
-    if (!account) {
-      console.error(`❌ Invalid account token: ${account_token}`);
-      return res.status(404).json({
-        success: false,
-        error: 'Invalid account token'
-      });
-    }
-
-    console.log(`✅ Account validated: ${account.accountLabel}`);
-
-    account.lastUsed = new Date();
-
-    const normalizedSignal = signal.toUpperCase();
-
-    // Route to appropriate handler based on signal type
-    if (normalizedSignal === 'BUY' || normalizedSignal === 'LONG') {
-      return await handleBuySignal(account_token, strategy_tag, symbol, quantity, account, res);
-    } else if (normalizedSignal === 'BUY_EXIT' || normalizedSignal === 'BUY EXIT') {
-      return await handleBuyExitSignal(account_token, strategy_tag, symbol, quantity, account, res);
-    } else if (normalizedSignal === 'SELL' || normalizedSignal === 'SHORT') {
-      return await handleSellSignal(account_token, strategy_tag, symbol, quantity, account, res);
-    } else if (normalizedSignal === 'SELL_EXIT' || normalizedSignal === 'SELL EXIT') {
-      return await handleSellExitSignal(account_token, strategy_tag, symbol, quantity, account, res);
-    } else if (normalizedSignal === 'EXIT' || normalizedSignal === 'CLOSE') {
-      return await handleExitSignal(account_token, strategy_tag, symbol, res);
-    } else if (normalizedSignal === 'STOP_AND_REVERSE' || normalizedSignal === 'SAR') {
-      return await handleStopAndReverseSignal(account_token, strategy_tag, symbol, quantity, account, res);
-    } else {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid signal type. Use: BUY, SELL, BUY_EXIT, SELL_EXIT, EXIT, or STOP_AND_REVERSE'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Webhook error:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-
-// Handle BUY signal
-async function handleBuySignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`📈 Processing BUY for strategy: ${strategyTag}, symbol: ${symbol}`);
-
-    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
-    }
-
-    let orderSize = quantity ? parseInt(quantity) : 1;
-    if (orderSize <= 0) orderSize = 1;
-
-    const orderPayload = {
-      product_id: product.id,
-      side: 'buy',
-      order_type: 'market_order',
-      size: orderSize
-    };
-
-    const payload = JSON.stringify(orderPayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-    const orderResponse = await axios.post(
-      `${account.baseUrl}${endpoint}`,
-      orderPayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (orderResponse.status === 200 && orderResponse.data.success) {
-      const order = orderResponse.data.result;
-      
-      orderMetadata.set(order.id, {
-        accountToken,
-        strategyTag,
-        symbol,
-        side: 'buy',
-        size: orderSize,
-        orderId: order.id,
-        timestamp: new Date()
-      });
-
-      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-      
-      if (strategyPositions.has(positionKey)) {
-        const existingPos = strategyPositions.get(positionKey);
-        existingPos.size += orderSize;
-        existingPos.orderIds.push(order.id);
-        existingPos.lastUpdated = new Date();
-      } else {
-        strategyPositions.set(positionKey, {
-          accountToken,
-          strategyTag,
-          symbol,
-          side: 'buy',
-          size: orderSize,
-          orderIds: [order.id],
-          createdAt: new Date(),
-          lastUpdated: new Date()
-        });
-      }
-
-      if (!accountStrategies.get(accountToken).has(strategyTag)) {
-        accountStrategies.get(accountToken).set(strategyTag, {
-          strategyTag,
-          symbols: new Set([symbol]),
-          totalOrders: 1,
-          createdAt: new Date(),
-          lastActivity: new Date()
-        });
-      } else {
-        const strategy = accountStrategies.get(accountToken).get(strategyTag);
-        strategy.symbols.add(symbol);
-        strategy.totalOrders += 1;
-        strategy.lastActivity = new Date();
-      }
-
-      console.log(`✅ BUY order placed: ${order.id}`);
-
-      return res.json({
-        success: true,
-        message: 'Buy order placed',
-        order: {
-          orderId: order.id,
-          symbol,
-          side: 'buy',
-          size: orderSize,
-          accountToken,
-          strategyTag
-        }
-      });
-    } else {
-      console.error('❌ Order placement failed:', orderResponse.data);
-      
-      return res.status(400).json({
-        success: false,
-        error: orderResponse.data.error?.message || 'Order placement failed'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Buy signal error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-// Handle SELL signal
-async function handleSellSignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`📉 Processing SELL for strategy: ${strategyTag}, symbol: ${symbol}`);
-
-    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
-    }
-
-    let orderSize = quantity ? parseInt(quantity) : 1;
-    if (orderSize <= 0) orderSize = 1;
-
-    const orderPayload = {
-      product_id: product.id,
-      side: 'sell',
-      order_type: 'market_order',
-      size: orderSize
-    };
-
-    const payload = JSON.stringify(orderPayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-    const orderResponse = await axios.post(
-      `${account.baseUrl}${endpoint}`,
-      orderPayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (orderResponse.status === 200 && orderResponse.data.success) {
-      const order = orderResponse.data.result;
-      
-      orderMetadata.set(order.id, {
-        accountToken,
-        strategyTag,
-        symbol,
-        side: 'sell',
-        size: orderSize,
-        orderId: order.id,
-        timestamp: new Date()
-      });
-
-      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
-      
-      if (strategyPositions.has(positionKey)) {
-        const existingPos = strategyPositions.get(positionKey);
-        existingPos.size += orderSize;
-        existingPos.orderIds.push(order.id);
-        existingPos.lastUpdated = new Date();
-      } else {
-        strategyPositions.set(positionKey, {
-          accountToken,
-          strategyTag,
-          symbol,
-          side: 'sell',
-          size: orderSize,
-          orderIds: [order.id],
-          createdAt: new Date(),
-          lastUpdated: new Date()
-        });
-      }
-
-      if (!accountStrategies.get(accountToken).has(strategyTag)) {
-        accountStrategies.get(accountToken).set(strategyTag, {
-          strategyTag,
-          symbols: new Set([symbol]),
-          totalOrders: 1,
-          createdAt: new Date(),
-          lastActivity: new Date()
-        });
-      } else {
-        const strategy = accountStrategies.get(accountToken).get(strategyTag);
-        strategy.symbols.add(symbol);
-        strategy.totalOrders += 1;
-        strategy.lastActivity = new Date();
-      }
-
-      console.log(`✅ SELL order placed: ${order.id}`);
-
-      return res.json({
-        success: true,
-        message: 'Sell order placed',
-        order: {
-          orderId: order.id,
-          symbol,
-          side: 'sell',
-          size: orderSize,
-          accountToken,
-          strategyTag
-        }
-      });
-    } else {
-      console.error('❌ Order placement failed:', orderResponse.data);
-      
-      return res.status(400).json({
-        success: false,
-        error: orderResponse.data.error?.message || 'Order placement failed'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Sell signal error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-// Handle BUY_EXIT signal - Exit from long positions
-async function handleBuyExitSignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`📉 Processing BUY_EXIT for strategy: ${strategyTag}, symbol: ${symbol}`);
-
-    const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-    const position = strategyPositions.get(positionKey);
-
-    if (!position) {
-      console.log('⚠️ No open long position found');
-      return res.json({
-        success: true,
-        message: 'No open long position to close',
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    const qtyToClose = quantity ? Math.min(parseInt(quantity), position.size) : position.size;
-
-    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
-    }
-
-    const closePayload = {
-      product_id: product.id,
-      side: 'sell',
-      order_type: 'market_order',
-      size: qtyToClose
-    };
-
-    const payload = JSON.stringify(closePayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-    const closeResponse = await axios.post(
-      `${account.baseUrl}${endpoint}`,
-      closePayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (closeResponse.status === 200 && closeResponse.data.success) {
-      const order = closeResponse.data.result;
-
-      if (qtyToClose >= position.size) {
-        strategyPositions.delete(positionKey);
-      } else {
-        position.size -= qtyToClose;
-        position.lastUpdated = new Date();
-      }
-
-      console.log(`✅ BUY_EXIT order placed: ${order.id} (qty: ${qtyToClose})`);
-
-      return res.json({
-        success: true,
-        message: 'Buy exit signal processed',
-        order: {
-          orderId: order.id,
-          symbol,
-          side: 'sell',
-          size: qtyToClose,
-          remainingSize: Math.max(0, position.size - qtyToClose),
-          accountToken,
-          strategyTag
-        }
-      });
-    } else {
-      console.error('❌ Close order failed:', closeResponse.data);
-      
-      return res.status(400).json({
-        success: false,
-        error: closeResponse.data.error?.message || 'Close order failed'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Buy exit signal error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-// Handle SELL_EXIT signal - Exit from short positions
-async function handleSellExitSignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`📈 Processing SELL_EXIT for strategy: ${strategyTag}, symbol: ${symbol}`);
-
-    const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
-    const position = strategyPositions.get(positionKey);
-
-    if (!position) {
-      console.log('⚠️ No open short position found');
-      return res.json({
-        success: true,
-        message: 'No open short position to close',
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    const qtyToClose = quantity ? Math.min(parseInt(quantity), position.size) : position.size;
-
-    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
-    }
-
-    const closePayload = {
-      product_id: product.id,
-      side: 'buy',
-      order_type: 'market_order',
-      size: qtyToClose
-    };
-
-    const payload = JSON.stringify(closePayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-    const closeResponse = await axios.post(
-      `${account.baseUrl}${endpoint}`,
-      closePayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (closeResponse.status === 200 && closeResponse.data.success) {
-      const order = closeResponse.data.result;
-
-      if (qtyToClose >= position.size) {
-        strategyPositions.delete(positionKey);
-      } else {
-        position.size -= qtyToClose;
-        position.lastUpdated = new Date();
-      }
-
-      console.log(`✅ SELL_EXIT order placed: ${order.id} (qty: ${qtyToClose})`);
-
-      return res.json({
-        success: true,
-        message: 'Sell exit signal processed',
-        order: {
-          orderId: order.id,
-          symbol,
-          side: 'buy',
-          size: qtyToClose,
-          remainingSize: Math.max(0, position.size - qtyToClose),
-          accountToken,
-          strategyTag
-        }
-      });
-    } else {
-      console.error('❌ Close order failed:', closeResponse.data);
-      
-      return res.status(400).json({
-        success: false,
-        error: closeResponse.data.error?.message || 'Close order failed'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Sell exit signal error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-// Handle STOP_AND_REVERSE signal
-async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`🔄 Processing STOP_AND_REVERSE for strategy: ${strategyTag}, symbol: ${symbol}`);
-
-    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
-
-    const buyPosition = strategyPositions.get(buyPositionKey);
-    const sellPosition = strategyPositions.get(sellPositionKey);
-
-    if (!buyPosition && !sellPosition) {
-      console.log('⚠️ No open position found for reversal');
-      return res.json({
-        success: true,
-        message: 'No open position to reverse',
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
-    }
-
-    const closeResults = [];
-    let reversedQty = 0;
-
-    // Close buy position and enter reverse (sell)
-    if (buyPosition) {
-      const closePayload = {
-        product_id: product.id,
-        side: 'sell',
-        order_type: 'market_order',
-        size: buyPosition.size
-      };
-
-      const payload = JSON.stringify(closePayload);
-      const endpoint = '/v2/orders';
-      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-      const closeResponse = await axios.post(
-        `${account.baseUrl}${endpoint}`,
-        closePayload,
-        { headers, timeout: 10000 }
-      );
-
-      if (closeResponse.data.success) {
-        strategyPositions.delete(buyPositionKey);
-        reversedQty = buyPosition.size;
-        closeResults.push({ side: 'buy', size: buyPosition.size, closed: true });
-      }
-    }
-
-    // Close sell position and enter reverse (buy)
-    if (sellPosition) {
-      const closePayload = {
-        product_id: product.id,
-        side: 'buy',
-        order_type: 'market_order',
-        size: sellPosition.size
-      };
-
-      const payload = JSON.stringify(closePayload);
-      const endpoint = '/v2/orders';
-      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-      const closeResponse = await axios.post(
-        `${account.baseUrl}${endpoint}`,
-        closePayload,
-        { headers, timeout: 10000 }
-      );
-
-      if (closeResponse.data.success) {
-        strategyPositions.delete(sellPositionKey);
-        reversedQty = sellPosition.size;
-        closeResults.push({ side: 'sell', size: sellPosition.size, closed: true });
-      }
-    }
-
-    // Enter reverse position
-    if (reversedQty > 0) {
-      const entryQty = quantity ? parseInt(quantity) : reversedQty;
-      const reverseSide = buyPosition ? 'sell' : 'buy';
-
-      const entryPayload = {
-        product_id: product.id,
-        side: reverseSide,
-        order_type: 'market_order',
-        size: entryQty
-      };
-
-      const payload = JSON.stringify(entryPayload);
-      const endpoint = '/v2/orders';
-      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-      const entryResponse = await axios.post(
-        `${account.baseUrl}${endpoint}`,
-        entryPayload,
-        { headers, timeout: 10000 }
-      );
-
-      if (entryResponse.data.success) {
-        const order = entryResponse.data.result;
-        const newPositionKey = getPositionKey(accountToken, strategyTag, symbol, reverseSide);
-
-        strategyPositions.set(newPositionKey, {
-          accountToken,
-          strategyTag,
-          symbol,
-          side: reverseSide,
-          size: entryQty,
-          orderIds: [order.id],
-          createdAt: new Date(),
-          lastUpdated: new Date()
-        });
-
-        closeResults.push({ side: reverseSide, size: entryQty, opened: true });
-      }
-    }
-
-    console.log(`✅ Stop and reverse completed`);
-
-    return res.json({
-      success: true,
-      message: 'Stop and reverse processed',
-      results: closeResults,
-      accountToken,
-      strategyTag,
-      symbol
-    });
-
-  } catch (error) {
-    console.error('❌ Stop and reverse error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-// Handle generic EXIT signal
-async function handleExitSignal(accountToken, strategyTag, symbol, res) {
-  try {
-    console.log(`🚪 Processing EXIT signal`);
-
-    const account = deltaAccounts.get(accountToken);
-
-    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
-
-    const buyPosition = strategyPositions.get(buyPositionKey);
-    const sellPosition = strategyPositions.get(sellPositionKey);
-
-    if (!buyPosition && !sellPosition) {
-      console.log('⚠️ No matching positions found for exit');
-      return res.json({
-        success: true,
-        message: 'No matching positions to exit',
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    const closedPositions = [];
-
-    if (buyPosition) {
-      const closePayload = {
-        product_id: await getProductId(symbol, account.baseUrl),
-        side: 'sell',
-        order_type: 'market_order',
-        size: buyPosition.size,
-        reduce_only: true
-      };
-
-      const result = await executeCloseOrder(closePayload, account);
-      if (result.success) {
-        strategyPositions.delete(buyPositionKey);
-        closedPositions.push({ side: 'buy', size: buyPosition.size });
-      }
-    }
-
-    if (sellPosition) {
-      const closePayload = {
-        product_id: await getProductId(symbol, account.baseUrl),
-        side: 'buy',
-        order_type: 'market_order',
-        size: sellPosition.size,
-        reduce_only: true
-      };
-
-      const result = await executeCloseOrder(closePayload, account);
-      if (result.success) {
-        strategyPositions.delete(sellPositionKey);
-        closedPositions.push({ side: 'sell', size: sellPosition.size });
-      }
-    }
-
-    console.log(`✅ Exit completed: ${closedPositions.length} position(s) closed`);
-
-    return res.json({
-      success: true,
-      message: 'Exit signal processed',
-      closedPositions,
-      accountToken,
-      strategyTag,
-      symbol
-    });
-
-  } catch (error) {
-    console.error('❌ Exit signal error:', error.message);
-    
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-}
-
-async function getProductId(symbol, baseUrl) {
-  const response = await axios.get(`${baseUrl}/v2/products`, {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 10000
-  });
-
-  const product = response.data.result.find(p => p.symbol === symbol);
-  return product ? product.id : null;
-}
-
-async function executeCloseOrder(orderPayload, account) {
-  try {
-    const payload = JSON.stringify(orderPayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
-
-    const response = await axios.post(
-      `${account.baseUrl}${endpoint}`,
-      orderPayload,
-      { headers, timeout: 10000 }
-    );
-
-    return { success: response.data.success, data: response.data };
-  } catch (error) {
-    console.error('❌ Close order error:', error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-// ========================================
-// 🎯 PHASE 3: SIGNAL PROVIDER SYSTEM
-// ========================================
-
-// ADMIN: CREATE SIGNAL
-app.post('/api/admin/signals/create', validateSession, async (req, res) => {
-  try {
-    if (!isAdmin(req)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Only signal provider can create signals'
-      });
-    }
-
-    const {
-      signal_type,
-      symbol,
-      quantity,
-      strategy_name,
-      description,
-      target_price,
-      stop_loss,
-      auto_execute
-    } = req.body;
-
-    console.log('🎯 ADMIN CREATING SIGNAL...');
-    console.log(`   Type: ${signal_type}`);
-    console.log(`   Symbol: ${symbol}`);
-    console.log(`   Strategy: ${strategy_name}`);
-
-    if (!signal_type || !symbol || !strategy_name) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: signal_type, symbol, strategy_name'
-      });
-    }
-
-    const signalId = generateSignalId();
-    
-    const signal = {
-      signalId,
-      signal_type: signal_type.toUpperCase(),
-      symbol,
-      quantity: quantity || 1,
-      strategy_name,
-      description: description || '',
-      target_price: target_price || null,
-      stop_loss: stop_loss || null,
-      auto_execute: auto_execute !== false,
-      status: 'active',
-      created_at: new Date(),
-      created_by: 'ADMIN',
-      execution_count: 0,
-      success_count: 0,
-      failure_count: 0
-    };
-
-    masterSignals.set(signalId, signal);
-    signalExecutions.set(signalId, new Map());
-
-    console.log(`✅ SIGNAL STORED IN DATABASE: ${signalId}`);
-
-    if (signal.auto_execute) {
-      console.log('📢 BROADCASTING TO ALL SUBSCRIBERS...');
-      await broadcastSignalToAllUsers(signal);
-    }
-
-    res.json({
-      success: true,
-      message: 'Signal created and broadcasted to all subscribers',
-      signal: {
-        signalId: signal.signalId,
-        signal_type: signal.signal_type,
-        symbol: signal.symbol,
-        quantity: signal.quantity,
-        strategy_name: signal.strategy_name,
-        description: signal.description,
-        auto_execute: signal.auto_execute,
-        created_at: signal.created_at,
-        execution_count: signal.execution_count,
-        success_count: signal.success_count,
-        failure_count: signal.failure_count
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error creating signal:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// BROADCAST TO ALL SUBSCRIBERS
-async function broadcastSignalToAllUsers(signal) {
-  console.log(`📢 BROADCASTING SIGNAL: ${signal.signalId}`);
-  console.log(`   Strategy: ${signal.strategy_name}`);
-  console.log(`   Signal: ${signal.signal_type} ${signal.symbol}`);
-
-  const subscribedUsers = Array.from(userSubscriptions.entries())
-    .filter(([sessionId, sub]) => 
-      sub.enabled && 
-      sub.strategies.includes(signal.strategy_name)
-    );
-
-  console.log(`   📊 Found ${subscribedUsers.length} subscribed users`);
-
-  if (subscribedUsers.length === 0) {
-    console.log('   ⚠️ No subscribers found for this strategy');
-    return;
-  }
-
-  for (const [sessionId, subscription] of subscribedUsers) {
-    try {
-      const userSession = userSessions.get(sessionId);
-      
-      if (!userSession) {
-        console.log(`   ⚠️ User session not found: ${sessionId}`);
-        continue;
-      }
-
-      console.log(`   📤 Executing for user: ${userSession.userInfo.email}`);
-
-      const result = await executeSignalOnUserAccount(signal, userSession);
-
-      signalExecutions.get(signal.signalId).set(sessionId, {
-        sessionId,
-        userEmail: userSession.userInfo.email,
-        success: result.success,
-        orderId: result.orderId || null,
-        error: result.error || null,
-        executed_at: new Date()
-      });
-
-      if (result.success) {
-        signal.success_count++;
-        console.log(`   ✅ SUCCESS for ${userSession.userInfo.email}`);
-      } else {
-        signal.failure_count++;
-        console.log(`   ❌ FAILED for ${userSession.userInfo.email}: ${result.error}`);
-      }
-
-      signal.execution_count++;
-
-    } catch (error) {
-      console.error(`   ❌ Error executing for user ${sessionId}:`, error.message);
-      signal.failure_count++;
-      signal.execution_count++;
-    }
-  }
-
-  console.log(`📢 BROADCAST COMPLETE:`);
-  console.log(`   ✅ Success: ${signal.success_count}`);
-  console.log(`   ❌ Failed: ${signal.failure_count}`);
-  console.log(`   📊 Total: ${signal.execution_count}`);
-}
-
-// EXECUTE SIGNAL ON USER ACCOUNT
-async function executeSignalOnUserAccount(signal, userSession) {
-  try {
-    const { apiKey, apiSecret, baseUrl } = userSession;
-
-    const productsResponse = await axios.get(`${baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const product = productsResponse.data.result.find(p => p.symbol === signal.symbol);
-    
-    if (!product) {
-      return {
-        success: false,
-        error: `Symbol ${signal.symbol} not found`
-      };
-    }
-
-    if (signal.signal_type === 'EXIT') {
-      const closePayload = {
-        product_id: product.id
-      };
-
-      const payload = JSON.stringify(closePayload);
-      const endpoint = '/v2/positions/close_all';
-      const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
-
-      const response = await axios.post(
-        `${baseUrl}${endpoint}`,
-        closePayload,
-        { 
-          headers, 
-          timeout: 10000,
-          validateStatus: function (status) {
-            return status < 500;
-          }
-        }
-      );
-
-      return {
-        success: response.data.success,
-        orderId: null,
-        message: 'Position closed'
-      };
-    }
-
-    const orderPayload = {
-      product_id: product.id,
-      side: signal.signal_type.toLowerCase(),
-      order_type: 'market_order',
-      size: signal.quantity
-    };
-
-    const payload = JSON.stringify(orderPayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
-
-    const response = await axios.post(
-      `${baseUrl}${endpoint}`,
-      orderPayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (response.status === 200 && response.data.success) {
-      return {
-        success: true,
-        orderId: response.data.result.id,
-        message: 'Order placed successfully'
-      };
-    } else {
-      return {
-        success: false,
-        error: response.data.error?.message || 'Order placement failed'
-      };
-    }
-
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    };
-  }
-}
-
-// USER: SUBSCRIBE TO SIGNALS
-app.post('/api/signals/subscribe', validateSession, (req, res) => {
-  try {
-    const sessionId = req.headers['x-session-id'];
-    const { strategies, enabled } = req.body;
-
-    console.log(`👥 USER SUBSCRIBING TO SIGNALS...`);
-    console.log(`   User: ${req.userSession.userInfo.email}`);
-    console.log(`   Strategies: ${strategies}`);
-
-    if (!strategies || !Array.isArray(strategies)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Strategies array is required'
-      });
-    }
-
-    userSubscriptions.set(sessionId, {
-      sessionId,
-      userEmail: req.userSession.userInfo.email,
-      strategies: strategies,
-      enabled: enabled !== false,
-      subscribed_at: userSubscriptions.has(sessionId) 
-        ? userSubscriptions.get(sessionId).subscribed_at 
-        : new Date(),
-      updated_at: new Date()
-    });
-
-    console.log(`✅ Subscription updated for ${req.userSession.userInfo.email}`);
-
-    res.json({
-      success: true,
-      subscription: {
-        strategies: strategies,
-        enabled: enabled !== false,
-        message: 'Successfully subscribed to signal provider strategies'
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error subscribing:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// USER: GET ALL SIGNALS
-app.get('/api/signals', validateSession, (req, res) => {
-  try {
-    const sessionId = req.headers['x-session-id'];
-    const { strategy_name, status } = req.query;
-
-    let signals = Array.from(masterSignals.values());
-
-    if (strategy_name) {
-      signals = signals.filter(s => s.strategy_name === strategy_name);
-    }
-
-    if (status) {
-      signals = signals.filter(s => s.status === status);
-    }
-
-    const subscription = userSubscriptions.get(sessionId);
-
-    const signalsWithStatus = signals.map(signal => {
-      const execution = signalExecutions.get(signal.signalId)?.get(sessionId);
-      
-      return {
-        signalId: signal.signalId,
-        signal_type: signal.signal_type,
-        symbol: signal.symbol,
-        quantity: signal.quantity,
-        strategy_name: signal.strategy_name,
-        description: signal.description,
-        target_price: signal.target_price,
-        stop_loss: signal.stop_loss,
-        status: signal.status,
-        created_at: signal.created_at,
-        execution_count: signal.execution_count,
-        success_count: signal.success_count,
-        failure_count: signal.failure_count,
-        success_rate: signal.execution_count > 0 
-          ? ((signal.success_count / signal.execution_count) * 100).toFixed(2) 
-          : 0,
-        user_execution: execution ? {
-          executed: true,
-          success: execution.success,
-          orderId: execution.orderId,
-          error: execution.error,
-          executed_at: execution.executed_at
-        } : {
-          executed: false
-        },
-        subscribed: subscription?.strategies.includes(signal.strategy_name) || false
-      };
-    });
-
-    res.json({
-      success: true,
-      signals: signalsWithStatus,
-      totalSignals: signalsWithStatus.length,
-      subscription: subscription ? {
-        enabled: subscription.enabled,
-        strategies: subscription.strategies,
-        subscribed_at: subscription.subscribed_at
-      } : null
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching signals:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ADMIN: GET ALL SIGNALS
-app.get('/api/admin/signals', validateSession, (req, res) => {
-  try {
-    if (!isAdmin(req)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Admin access required'
-      });
-    }
-
-    const signals = Array.from(masterSignals.values()).map(signal => {
-      const executions = Array.from(signalExecutions.get(signal.signalId)?.values() || []);
-      
-      return {
-        signalId: signal.signalId,
-        signal_type: signal.signal_type,
-        symbol: signal.symbol,
-        quantity: signal.quantity,
-        strategy_name: signal.strategy_name,
-        description: signal.description,
-        target_price: signal.target_price,
-        stop_loss: signal.stop_loss,
-        status: signal.status,
-        created_at: signal.created_at,
-        execution_count: signal.execution_count,
-        success_count: signal.success_count,
-        failure_count: signal.failure_count,
-        success_rate: signal.execution_count > 0 
-          ? ((signal.success_count / signal.execution_count) * 100).toFixed(2) 
-          : 0,
-        executions: executions.map(exec => ({
-          userEmail: exec.userEmail,
-          success: exec.success,
-          orderId: exec.orderId,
-          error: exec.error,
-          executed_at: exec.executed_at
-        }))
-      };
-    });
-
-    const totalSubscribers = userSubscriptions.size;
-    const activeSubscribers = Array.from(userSubscriptions.values())
-      .filter(sub => sub.enabled).length;
-
-    res.json({
-      success: true,
-      signals,
-      totalSignals: signals.length,
-      statistics: {
-        totalSubscribers,
-        activeSubscribers,
-        totalSignals: signals.length,
-        activeSignals: signals.filter(s => s.status === 'active').length
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching admin signals:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ADMIN: DELETE SIGNAL
-app.delete('/api/admin/signals/:signalId', validateSession, (req, res) => {
-  try {
-    if (!isAdmin(req)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Admin access required'
-      });
-    }
-
-    const { signalId } = req.params;
-
-    if (!masterSignals.has(signalId)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Signal not found'
-      });
-    }
-
-    const signal = masterSignals.get(signalId);
-    
-    masterSignals.delete(signalId);
-    signalExecutions.delete(signalId);
-
-    console.log(`🗑️ Signal deleted: ${signalId}`);
-
-    res.json({
-      success: true,
-      message: 'Signal deleted successfully',
-      deletedSignal: {
-        signalId: signal.signalId,
-        strategy_name: signal.strategy_name,
-        signal_type: signal.signal_type,
-        symbol: signal.symbol
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error deleting signal:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// GET AVAILABLE STRATEGIES
-app.get('/api/strategies/available', validateSession, (req, res) => {
-  try {
-    const strategies = [...new Set(
-      Array.from(masterSignals.values()).map(s => s.strategy_name)
-    )];
-
-    const strategyStats = strategies.map(strategyName => {
-      const signals = Array.from(masterSignals.values())
-        .filter(s => s.strategy_name === strategyName);
-
-      const totalSignals = signals.length;
-      const activeSignals = signals.filter(s => s.status === 'active').length;
-      const totalExecutions = signals.reduce((sum, s) => sum + s.execution_count, 0);
-      const totalSuccess = signals.reduce((sum, s) => sum + s.success_count, 0);
-      const successRate = totalExecutions > 0
-        ? ((totalSuccess / totalExecutions) * 100).toFixed(2)
-        : 0;
-
-      const subscriberCount = Array.from(userSubscriptions.values())
-        .filter(sub => sub.enabled && sub.strategies.includes(strategyName))
-        .length;
-
-      return {
-        strategy_name: strategyName,
-        totalSignals,
-        activeSignals,
-        totalExecutions,
-        successRate: parseFloat(successRate),
-        subscriberCount,
-        latestSignal: signals.length > 0 
-          ? signals[signals.length - 1].created_at 
-          : null
-      };
-    });
-
-    res.json({
-      success: true,
-      strategies: strategyStats,
-      totalStrategies: strategies.length
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching strategies:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ADMIN: GET SUBSCRIBERS
-app.get('/api/admin/subscribers', validateSession, (req, res) => {
-  try {
-    if (!isAdmin(req)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Admin access required'
-      });
-    }
-
-    const subscribers = Array.from(userSubscriptions.values()).map(sub => ({
-      userEmail: sub.userEmail,
-      strategies: sub.strategies,
-      enabled: sub.enabled,
-      subscribed_at: sub.subscribed_at,
-      updated_at: sub.updated_at
-    }));
-
-    res.json({
-      success: true,
-      subscribers,
-      totalSubscribers: subscribers.length,
-      activeSubscribers: subscribers.filter(s => s.enabled).length
-    });
-
-  } catch (error) {
-    console.error('❌ Error fetching subscribers:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ADMIN: MANUALLY BROADCAST SIGNAL
-app.post('/api/admin/signals/:signalId/broadcast', validateSession, async (req, res) => {
-  try {
-    if (!isAdmin(req)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Admin access required'
-      });
-    }
-
-    const { signalId } = req.params;
-
-    if (!masterSignals.has(signalId)) {
-      return res.status(404).json({
-        success: false,
-        error: 'Signal not found'
-      });
-    }
-
-    const signal = masterSignals.get(signalId);
-
-    console.log(`🔄 MANUALLY BROADCASTING SIGNAL: ${signalId}`);
-
-    signal.execution_count = 0;
-    signal.success_count = 0;
-    signal.failure_count = 0;
-
-    await broadcastSignalToAllUsers(signal);
-
-    res.json({
-      success: true,
-      message: 'Signal broadcasted successfully',
-      signal: {
-        signalId: signal.signalId,
-        execution_count: signal.execution_count,
-        success_count: signal.success_count,
-        failure_count: signal.failure_count
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error broadcasting signal:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ========================================
-// 📜 TRADING ENDPOINTS
-// ========================================
-
-app.get('/api/symbols', validateSession, async (req, res) => {
-  try {
-    const { baseUrl } = req.userSession;
-    
-    const response = await axios.get(`${baseUrl}/v2/products`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    const symbols = response.data.result
-      .filter(product => product.contract_type === 'perpetual_futures' && product.trading_status === 'operational')
-      .map(product => ({
-        symbol: product.symbol,
-        product_id: product.id,
-        description: product.description,
-        tick_size: product.tick_size,
-        contract_value: product.contract_value,
-        trading_status: product.trading_status
-      }));
-
-    res.json({
-      success: true,
-      symbols: symbols
-    });
-  } catch (error) {
-    console.error('❌ Error fetching symbols:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.post('/api/order', validateSession, async (req, res) => {
-  try {
-    const { product_id, side, order_type, size, limit_price } = req.body;
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-
-    const orderPayload = {
-      product_id: parseInt(product_id),
-      side: side,
-      order_type: order_type,
-      size: parseInt(size)
-    };
-
-    if (order_type === 'limit_order' && limit_price) {
-      orderPayload.limit_price = limit_price.toString();
-    }
-
-    const payload = JSON.stringify(orderPayload);
-    const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
-
-    const response = await axios.post(
-      `${baseUrl}${endpoint}`,
-      orderPayload,
-      { 
-        headers, 
-        timeout: 10000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (response.status === 200 && response.data.success) {
-      res.json({
-        success: true,
-        order: response.data.result
-      });
-    } else {
-      res.status(400).json({
-        success: false,
-        error: response.data.error?.message || 'Order placement failed',
-        code: response.data.error?.code,
-        details: response.data.error
-      });
-    }
-  } catch (error) {
-    console.error('❌ Error placing order:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message,
-      details: error.response?.data?.error
-    });
-  }
-});
-
-app.get('/api/positions', validateSession, async (req, res) => {
-  try {
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-    const endpoint = '/v2/positions/margined';
-    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
-
-    const response = await axios.get(
-      `${baseUrl}${endpoint}`,
-      { headers, timeout: 10000 }
-    );
-
-    const positions = response.data.result
-      .filter(pos => Math.abs(pos.size) > 0)
-      .map(pos => ({
-        id: pos.product_id,
-        product_id: pos.product_id,
-        symbol: pos.product_symbol,
-        side: pos.size > 0 ? 'buy' : 'sell',
-        size: Math.abs(pos.size),
-        entry_price: parseFloat(pos.entry_price || 0),
-        unrealized_pnl: parseFloat(pos.unrealized_pnl || 0),
-        liquidation_price: parseFloat(pos.liquidation_price || 0),
-        leverage: pos.leverage || 1
-      }));
-
-    res.json({
-      success: true,
-      positions: positions
-    });
-  } catch (error) {
-    console.error('❌ Error fetching positions:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.post('/api/position/close', validateSession, async (req, res) => {
-  try {
-    const { product_id } = req.body;
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-
-    const closePayload = {
-      product_id: parseInt(product_id)
-    };
-
-    const payload = JSON.stringify(closePayload);
-    const endpoint = '/v2/positions/close_all';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
-
-    const response = await axios.post(
-      `${baseUrl}${endpoint}`,
-      closePayload,
-      { headers, timeout: 10000 }
-    );
-
-    res.json({
-      success: true,
-      result: response.data.result
-    });
-  } catch (error) {
-    console.error('❌ Error closing position:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.get('/api/orders/history', validateSession, async (req, res) => {
-  try {
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-    const limit = req.query.limit || 20;
-    const endpoint = '/v2/orders/history';
-    const queryString = `?page_size=${limit}`;
-    const headers = getAuthHeaders('GET', endpoint, queryString, '', apiKey, apiSecret);
-
-    const response = await axios.get(
-      `${baseUrl}${endpoint}${queryString}`,
-      { headers, timeout: 10000 }
-    );
-
-    const orders = response.data.result.map(order => ({
-      id: order.id,
-      product_id: order.product_id,
-      symbol: order.product_symbol,
-      side: order.side,
-      order_type: order.order_type,
-      size: order.size,
-      price: parseFloat(order.limit_price || order.stop_price || 0),
-      filled: order.unfilled_size ? order.size - order.unfilled_size : order.size,
-      status: order.state,
-      created_at: order.created_at,
-      commission: parseFloat(order.commission || 0)
-    }));
-
-    res.json({
-      success: true,
-      orders: orders
-    });
-  } catch (error) {
-    console.error('❌ Error fetching order history:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.get('/api/account', validateSession, async (req, res) => {
-  try {
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-    const endpoint = '/v2/wallet/balances';
-    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
-
-    const response = await axios.get(
-      `${baseUrl}${endpoint}`,
-      { headers, timeout: 10000 }
-    );
-
-    let walletData = response.data.result.find(w => w.asset_symbol === 'USDT');
-    if (!walletData) {
-      walletData = response.data.result.find(w => w.asset_symbol === 'USD');
-    }
-    if (!walletData) {
-      walletData = response.data.result.find(w => parseFloat(w.balance || 0) > 0);
-    }
-    if (!walletData) {
-      walletData = response.data.result[0] || {};
-    }
-
-    const account = {
-      asset_symbol: walletData.asset_symbol || 'USDT',
-      available_balance: parseFloat(walletData.available_balance || 0),
-      total_balance: parseFloat(walletData.balance || 0),
-      margin_balance: parseFloat(walletData.available_balance || 0),
-      initial_margin: parseFloat(walletData.order_margin || 0) + parseFloat(walletData.position_margin || 0),
-      maintenance_margin: parseFloat(walletData.position_margin || 0),
-      unrealized_pnl: parseFloat(walletData.unrealized_pnl || 0),
-      all_wallets: response.data.result.map(w => ({
-        asset: w.asset_symbol,
-        balance: parseFloat(w.balance || 0),
-        available: parseFloat(w.available_balance || 0)
-      }))
-    };
-
-    res.json({
-      success: true,
-      account: account
-    });
-  } catch (error) {
-    console.error('❌ Error fetching account info:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.get('/api/wallet', validateSession, async (req, res) => {
-  try {
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-    const endpoint = '/v2/wallet/balances';
-    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
-
-    const response = await axios.get(
-      `${baseUrl}${endpoint}`,
-      { headers, timeout: 10000 }
-    );
-
-    res.json({
-      success: true,
-      balances: response.data.result
-    });
-  } catch (error) {
-    console.error('❌ Error fetching wallet:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.get('/api/market-data', validateSession, async (req, res) => {
-  try {
-    const { symbol } = req.query;
-    const { baseUrl } = req.userSession;
-
-    const response = await axios.get(`${baseUrl}/v2/tickers/${symbol}`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    res.json({
-      success: true,
-      data: response.data.result
-    });
-  } catch (error) {
-    console.error('❌ Error fetching market data:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
-app.get('/api/product/:productId', validateSession, async (req, res) => {
-  try {
-    const { productId } = req.params;
-    const { baseUrl } = req.userSession;
-
-    const response = await axios.get(`${baseUrl}/v2/products/${productId}`, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 10000
-    });
-
-    res.json({
-      success: true,
-      product: response.data.result
-    });
-  } catch (error) {
-    console.error('❌ Error fetching product info:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
 // ========================================
 // 📡 ENHANCED TRADINGVIEW WEBHOOK - ALL MESSAGE TYPES
 // ========================================
@@ -3038,31 +1381,65 @@ async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, qua
 }
 
 // ========================================
-// 🛠️ HELPER FUNCTIONS
+// 📜 TRADING ENDPOINTS (Keep existing code)
 // ========================================
 
-async function getProductBySymbol(symbol, baseUrl) {
+app.get('/api/symbols', validateSession, async (req, res) => {
   try {
+    const { baseUrl } = req.userSession;
+    
     const response = await axios.get(`${baseUrl}/v2/products`, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 10000
     });
 
-    return response.data.result.find(p => p.symbol === symbol);
-  } catch (error) {
-    console.error('❌ Error fetching product:', error.message);
-    return null;
-  }
-}
+    const symbols = response.data.result
+      .filter(product => product.contract_type === 'perpetual_futures' && product.trading_status === 'operational')
+      .map(product => ({
+        symbol: product.symbol,
+        product_id: product.id,
+        description: product.description,
+        tick_size: product.tick_size,
+        contract_value: product.contract_value,
+        trading_status: product.trading_status
+      }));
 
-async function placeOrder(orderPayload, account) {
+    res.json({
+      success: true,
+      symbols: symbols
+    });
+  } catch (error) {
+    console.error('❌ Error fetching symbols:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.post('/api/order', validateSession, async (req, res) => {
   try {
+    const { product_id, side, order_type, size, limit_price } = req.body;
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+
+    const orderPayload = {
+      product_id: parseInt(product_id),
+      side: side,
+      order_type: order_type,
+      size: parseInt(size)
+    };
+
+    if (order_type === 'limit_order' && limit_price) {
+      orderPayload.limit_price = limit_price.toString();
+    }
+
     const payload = JSON.stringify(orderPayload);
     const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
 
     const response = await axios.post(
-      `${account.baseUrl}${endpoint}`,
+      `${baseUrl}${endpoint}`,
       orderPayload,
       { 
         headers, 
@@ -3074,40 +1451,265 @@ async function placeOrder(orderPayload, account) {
     );
 
     if (response.status === 200 && response.data.success) {
-      return {
+      res.json({
         success: true,
         order: response.data.result
-      };
+      });
     } else {
-      return {
+      res.status(400).json({
         success: false,
-        error: response.data.error?.message || 'Order placement failed'
-      };
+        error: response.data.error?.message || 'Order placement failed',
+        code: response.data.error?.code,
+        details: response.data.error
+      });
     }
   } catch (error) {
-    return {
+    console.error('❌ Error placing order:', error.message);
+    
+    res.status(500).json({
       success: false,
-      error: error.message
-    };
-  }
-}
-
-function updateStrategyTracking(accountToken, strategyTag, symbol) {
-  if (!accountStrategies.get(accountToken).has(strategyTag)) {
-    accountStrategies.get(accountToken).set(strategyTag, {
-      strategyTag,
-      symbols: new Set([symbol]),
-      totalOrders: 1,
-      createdAt: new Date(),
-      lastActivity: new Date()
+      error: error.response?.data?.error?.message || error.message,
+      details: error.response?.data?.error
     });
-  } else {
-    const strategy = accountStrategies.get(accountToken).get(strategyTag);
-    strategy.symbols.add(symbol);
-    strategy.totalOrders += 1;
-    strategy.lastActivity = new Date();
   }
-}
+});
+
+app.get('/api/positions', validateSession, async (req, res) => {
+  try {
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+    const endpoint = '/v2/positions/margined';
+    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
+
+    const response = await axios.get(
+      `${baseUrl}${endpoint}`,
+      { headers, timeout: 10000 }
+    );
+
+    const positions = response.data.result
+      .filter(pos => Math.abs(pos.size) > 0)
+      .map(pos => ({
+        id: pos.product_id,
+        product_id: pos.product_id,
+        symbol: pos.product_symbol,
+        side: pos.size > 0 ? 'buy' : 'sell',
+        size: Math.abs(pos.size),
+        entry_price: parseFloat(pos.entry_price || 0),
+        unrealized_pnl: parseFloat(pos.unrealized_pnl || 0),
+        liquidation_price: parseFloat(pos.liquidation_price || 0),
+        leverage: pos.leverage || 1
+      }));
+
+    res.json({
+      success: true,
+      positions: positions
+    });
+  } catch (error) {
+    console.error('❌ Error fetching positions:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.post('/api/position/close', validateSession, async (req, res) => {
+  try {
+    const { product_id } = req.body;
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+
+    const closePayload = {
+      product_id: parseInt(product_id)
+    };
+
+    const payload = JSON.stringify(closePayload);
+    const endpoint = '/v2/positions/close_all';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
+
+    const response = await axios.post(
+      `${baseUrl}${endpoint}`,
+      closePayload,
+      { headers, timeout: 10000 }
+    );
+
+    res.json({
+      success: true,
+      result: response.data.result
+    });
+  } catch (error) {
+    console.error('❌ Error closing position:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/orders/history', validateSession, async (req, res) => {
+  try {
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+    const limit = req.query.limit || 20;
+    const endpoint = '/v2/orders/history';
+    const queryString = `?page_size=${limit}`;
+    const headers = getAuthHeaders('GET', endpoint, queryString, '', apiKey, apiSecret);
+
+    const response = await axios.get(
+      `${baseUrl}${endpoint}${queryString}`,
+      { headers, timeout: 10000 }
+    );
+
+    const orders = response.data.result.map(order => ({
+      id: order.id,
+      product_id: order.product_id,
+      symbol: order.product_symbol,
+      side: order.side,
+      order_type: order.order_type,
+      size: order.size,
+      price: parseFloat(order.limit_price || order.stop_price || 0),
+      filled: order.unfilled_size ? order.size - order.unfilled_size : order.size,
+      status: order.state,
+      created_at: order.created_at,
+      commission: parseFloat(order.commission || 0)
+    }));
+
+    res.json({
+      success: true,
+      orders: orders
+    });
+  } catch (error) {
+    console.error('❌ Error fetching order history:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/account', validateSession, async (req, res) => {
+  try {
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+    const endpoint = '/v2/wallet/balances';
+    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
+
+    const response = await axios.get(
+      `${baseUrl}${endpoint}`,
+      { headers, timeout: 10000 }
+    );
+
+    let walletData = response.data.result.find(w => w.asset_symbol === 'USDT');
+    if (!walletData) {
+      walletData = response.data.result.find(w => w.asset_symbol === 'USD');
+    }
+    if (!walletData) {
+      walletData = response.data.result.find(w => parseFloat(w.balance || 0) > 0);
+    }
+    if (!walletData) {
+      walletData = response.data.result[0] || {};
+    }
+
+    const account = {
+      asset_symbol: walletData.asset_symbol || 'USDT',
+      available_balance: parseFloat(walletData.available_balance || 0),
+      total_balance: parseFloat(walletData.balance || 0),
+      margin_balance: parseFloat(walletData.available_balance || 0),
+      initial_margin: parseFloat(walletData.order_margin || 0) + parseFloat(walletData.position_margin || 0),
+      maintenance_margin: parseFloat(walletData.position_margin || 0),
+      unrealized_pnl: parseFloat(walletData.unrealized_pnl || 0),
+      all_wallets: response.data.result.map(w => ({
+        asset: w.asset_symbol,
+        balance: parseFloat(w.balance || 0),
+        available: parseFloat(w.available_balance || 0)
+      }))
+    };
+
+    res.json({
+      success: true,
+      account: account
+    });
+  } catch (error) {
+    console.error('❌ Error fetching account info:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/wallet', validateSession, async (req, res) => {
+  try {
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+    const endpoint = '/v2/wallet/balances';
+    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
+
+    const response = await axios.get(
+      `${baseUrl}${endpoint}`,
+      { headers, timeout: 10000 }
+    );
+
+    res.json({
+      success: true,
+      balances: response.data.result
+    });
+  } catch (error) {
+    console.error('❌ Error fetching wallet:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/market-data', validateSession, async (req, res) => {
+  try {
+    const { symbol } = req.query;
+    const { baseUrl } = req.userSession;
+
+    const response = await axios.get(`${baseUrl}/v2/tickers/${symbol}`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    res.json({
+      success: true,
+      data: response.data.result
+    });
+  } catch (error) {
+    console.error('❌ Error fetching market data:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
+app.get('/api/product/:productId', validateSession, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    const { baseUrl } = req.userSession;
+
+    const response = await axios.get(`${baseUrl}/v2/products/${productId}`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    res.json({
+      success: true,
+      product: response.data.result
+    });
+  } catch (error) {
+    console.error('❌ Error fetching product info:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
 
 // ========================================
 // 🧹 CLEANUP & ERROR HANDLING
@@ -3136,17 +1738,21 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log('='.repeat(70));
-  console.log('🚀 Delta Trading Bridge - PHASE 3: SIGNAL PROVIDER SYSTEM');
+  console.log('🚀 Delta Trading Bridge - PHASE 2 ENHANCED: ALL WEBHOOK TYPES');
   console.log('='.repeat(70));
   console.log(`📡 Server running on: http://localhost:${PORT}`);
   console.log(`🔐 Session-based authentication enabled`);
   console.log(`🏦 Multi-account support with token-based routing`);
   console.log(`🏷️  Strategy-level isolation and tracking`);
-  console.log(`🎯 Signal Provider System: Broadcast to all subscribers`);
   console.log(`📊 TradingView webhook endpoint: /api/webhook/tradingview`);
   console.log('='.repeat(70));
-  console.log(`👤 Admin API Key: ${ADMIN_API_KEY ? '✅ Configured' : '❌ Not Set'}`);
-  console.log(`📢 Signal Broadcasting: ${ADMIN_API_KEY ? 'ENABLED' : 'DISABLED'}`);
+  console.log('✅ SUPPORTED WEBHOOK SIGNALS:');
+  console.log('   1. BUY - Open long position');
+  console.log('   2. SELL - Open short position');
+  console.log('   3. BUY_EXIT - Close long position (full/partial)');
+  console.log('   4. SELL_EXIT - Close short position (full/partial)');
+  console.log('   5. EXIT - Close all positions');
+  console.log('   6. STOP_AND_REVERSE - Reverse position direction');
   console.log('='.repeat(70));
   console.log('');
 });
