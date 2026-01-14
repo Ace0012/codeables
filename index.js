@@ -591,18 +591,25 @@ app.post('/api/webhook/tradingview', async (req, res) => {
 
     const normalizedSignal = signal.toUpperCase();
 
-    if (normalizedSignal === 'EXIT' || normalizedSignal === 'CLOSE') {
+    // Route to appropriate handler based on signal type
+    if (normalizedSignal === 'BUY' || normalizedSignal === 'LONG') {
+      return await handleBuySignal(account_token, strategy_tag, symbol, quantity, account, res);
+    } else if (normalizedSignal === 'BUY_EXIT' || normalizedSignal === 'BUY EXIT') {
+      return await handleBuyExitSignal(account_token, strategy_tag, symbol, quantity, account, res);
+    } else if (normalizedSignal === 'SELL' || normalizedSignal === 'SHORT') {
+      return await handleSellSignal(account_token, strategy_tag, symbol, quantity, account, res);
+    } else if (normalizedSignal === 'SELL_EXIT' || normalizedSignal === 'SELL EXIT') {
+      return await handleSellExitSignal(account_token, strategy_tag, symbol, quantity, account, res);
+    } else if (normalizedSignal === 'EXIT' || normalizedSignal === 'CLOSE') {
       return await handleExitSignal(account_token, strategy_tag, symbol, res);
+    } else if (normalizedSignal === 'STOP_AND_REVERSE' || normalizedSignal === 'SAR') {
+      return await handleStopAndReverseSignal(account_token, strategy_tag, symbol, quantity, account, res);
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid signal type. Use: BUY, SELL, BUY_EXIT, SELL_EXIT, EXIT, or STOP_AND_REVERSE'
+      });
     }
-
-    if (normalizedSignal === 'BUY' || normalizedSignal === 'SELL') {
-      return await handleTradeSignal(account_token, strategy_tag, normalizedSignal, symbol, quantity, account, res);
-    }
-
-    return res.status(400).json({
-      success: false,
-      error: 'Invalid signal type. Must be BUY, SELL, or EXIT'
-    });
 
   } catch (error) {
     console.error('❌ Webhook error:', error.message);
@@ -614,9 +621,11 @@ app.post('/api/webhook/tradingview', async (req, res) => {
   }
 });
 
-async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quantity, account, res) {
+
+// Handle BUY signal
+async function handleBuySignal(accountToken, strategyTag, symbol, quantity, account, res) {
   try {
-    console.log(`🔄 Processing ${signal} signal for ${symbol}`);
+    console.log(`📈 Processing BUY for strategy: ${strategyTag}, symbol: ${symbol}`);
 
     const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
       headers: { 'Content-Type': 'application/json' },
@@ -624,7 +633,6 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
     });
 
     const product = productsResponse.data.result.find(p => p.symbol === symbol);
-    
     if (!product) {
       return res.status(404).json({
         success: false,
@@ -637,7 +645,7 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
 
     const orderPayload = {
       product_id: product.id,
-      side: signal.toLowerCase(),
+      side: 'buy',
       order_type: 'market_order',
       size: orderSize
     };
@@ -665,13 +673,13 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
         accountToken,
         strategyTag,
         symbol,
-        side: signal.toLowerCase(),
+        side: 'buy',
         size: orderSize,
         orderId: order.id,
         timestamp: new Date()
       });
 
-      const positionKey = getPositionKey(accountToken, strategyTag, symbol, signal.toLowerCase());
+      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
       
       if (strategyPositions.has(positionKey)) {
         const existingPos = strategyPositions.get(positionKey);
@@ -683,7 +691,7 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
           accountToken,
           strategyTag,
           symbol,
-          side: signal.toLowerCase(),
+          side: 'buy',
           size: orderSize,
           orderIds: [order.id],
           createdAt: new Date(),
@@ -706,15 +714,15 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
         strategy.lastActivity = new Date();
       }
 
-      console.log(`✅ Order placed successfully: ${order.id}`);
+      console.log(`✅ BUY order placed: ${order.id}`);
 
       return res.json({
         success: true,
-        message: `${signal} order placed successfully`,
+        message: 'Buy order placed',
         order: {
           orderId: order.id,
           symbol,
-          side: signal.toLowerCase(),
+          side: 'buy',
           size: orderSize,
           accountToken,
           strategyTag
@@ -730,7 +738,7 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
     }
 
   } catch (error) {
-    console.error('❌ Trade signal error:', error.message);
+    console.error('❌ Buy signal error:', error.message);
     
     return res.status(500).json({
       success: false,
@@ -739,6 +747,486 @@ async function handleTradeSignal(accountToken, strategyTag, signal, symbol, quan
   }
 }
 
+// Handle SELL signal
+async function handleSellSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`📉 Processing SELL for strategy: ${strategyTag}, symbol: ${symbol}`);
+
+    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    const product = productsResponse.data.result.find(p => p.symbol === symbol);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    let orderSize = quantity ? parseInt(quantity) : 1;
+    if (orderSize <= 0) orderSize = 1;
+
+    const orderPayload = {
+      product_id: product.id,
+      side: 'sell',
+      order_type: 'market_order',
+      size: orderSize
+    };
+
+    const payload = JSON.stringify(orderPayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+    const orderResponse = await axios.post(
+      `${account.baseUrl}${endpoint}`,
+      orderPayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (orderResponse.status === 200 && orderResponse.data.success) {
+      const order = orderResponse.data.result;
+      
+      orderMetadata.set(order.id, {
+        accountToken,
+        strategyTag,
+        symbol,
+        side: 'sell',
+        size: orderSize,
+        orderId: order.id,
+        timestamp: new Date()
+      });
+
+      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+      
+      if (strategyPositions.has(positionKey)) {
+        const existingPos = strategyPositions.get(positionKey);
+        existingPos.size += orderSize;
+        existingPos.orderIds.push(order.id);
+        existingPos.lastUpdated = new Date();
+      } else {
+        strategyPositions.set(positionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: 'sell',
+          size: orderSize,
+          orderIds: [order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+      }
+
+      if (!accountStrategies.get(accountToken).has(strategyTag)) {
+        accountStrategies.get(accountToken).set(strategyTag, {
+          strategyTag,
+          symbols: new Set([symbol]),
+          totalOrders: 1,
+          createdAt: new Date(),
+          lastActivity: new Date()
+        });
+      } else {
+        const strategy = accountStrategies.get(accountToken).get(strategyTag);
+        strategy.symbols.add(symbol);
+        strategy.totalOrders += 1;
+        strategy.lastActivity = new Date();
+      }
+
+      console.log(`✅ SELL order placed: ${order.id}`);
+
+      return res.json({
+        success: true,
+        message: 'Sell order placed',
+        order: {
+          orderId: order.id,
+          symbol,
+          side: 'sell',
+          size: orderSize,
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      console.error('❌ Order placement failed:', orderResponse.data);
+      
+      return res.status(400).json({
+        success: false,
+        error: orderResponse.data.error?.message || 'Order placement failed'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Sell signal error:', error.message);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// Handle BUY_EXIT signal - Exit from long positions
+async function handleBuyExitSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`📉 Processing BUY_EXIT for strategy: ${strategyTag}, symbol: ${symbol}`);
+
+    const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const position = strategyPositions.get(positionKey);
+
+    if (!position) {
+      console.log('⚠️ No open long position found');
+      return res.json({
+        success: true,
+        message: 'No open long position to close',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const qtyToClose = quantity ? Math.min(parseInt(quantity), position.size) : position.size;
+
+    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    const product = productsResponse.data.result.find(p => p.symbol === symbol);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    const closePayload = {
+      product_id: product.id,
+      side: 'sell',
+      order_type: 'market_order',
+      size: qtyToClose
+    };
+
+    const payload = JSON.stringify(closePayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+    const closeResponse = await axios.post(
+      `${account.baseUrl}${endpoint}`,
+      closePayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (closeResponse.status === 200 && closeResponse.data.success) {
+      const order = closeResponse.data.result;
+
+      if (qtyToClose >= position.size) {
+        strategyPositions.delete(positionKey);
+      } else {
+        position.size -= qtyToClose;
+        position.lastUpdated = new Date();
+      }
+
+      console.log(`✅ BUY_EXIT order placed: ${order.id} (qty: ${qtyToClose})`);
+
+      return res.json({
+        success: true,
+        message: 'Buy exit signal processed',
+        order: {
+          orderId: order.id,
+          symbol,
+          side: 'sell',
+          size: qtyToClose,
+          remainingSize: Math.max(0, position.size - qtyToClose),
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      console.error('❌ Close order failed:', closeResponse.data);
+      
+      return res.status(400).json({
+        success: false,
+        error: closeResponse.data.error?.message || 'Close order failed'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Buy exit signal error:', error.message);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// Handle SELL_EXIT signal - Exit from short positions
+async function handleSellExitSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`📈 Processing SELL_EXIT for strategy: ${strategyTag}, symbol: ${symbol}`);
+
+    const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+    const position = strategyPositions.get(positionKey);
+
+    if (!position) {
+      console.log('⚠️ No open short position found');
+      return res.json({
+        success: true,
+        message: 'No open short position to close',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const qtyToClose = quantity ? Math.min(parseInt(quantity), position.size) : position.size;
+
+    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    const product = productsResponse.data.result.find(p => p.symbol === symbol);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    const closePayload = {
+      product_id: product.id,
+      side: 'buy',
+      order_type: 'market_order',
+      size: qtyToClose
+    };
+
+    const payload = JSON.stringify(closePayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+    const closeResponse = await axios.post(
+      `${account.baseUrl}${endpoint}`,
+      closePayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (closeResponse.status === 200 && closeResponse.data.success) {
+      const order = closeResponse.data.result;
+
+      if (qtyToClose >= position.size) {
+        strategyPositions.delete(positionKey);
+      } else {
+        position.size -= qtyToClose;
+        position.lastUpdated = new Date();
+      }
+
+      console.log(`✅ SELL_EXIT order placed: ${order.id} (qty: ${qtyToClose})`);
+
+      return res.json({
+        success: true,
+        message: 'Sell exit signal processed',
+        order: {
+          orderId: order.id,
+          symbol,
+          side: 'buy',
+          size: qtyToClose,
+          remainingSize: Math.max(0, position.size - qtyToClose),
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      console.error('❌ Close order failed:', closeResponse.data);
+      
+      return res.status(400).json({
+        success: false,
+        error: closeResponse.data.error?.message || 'Close order failed'
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Sell exit signal error:', error.message);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// Handle STOP_AND_REVERSE signal
+async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`🔄 Processing STOP_AND_REVERSE for strategy: ${strategyTag}, symbol: ${symbol}`);
+
+    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+
+    const buyPosition = strategyPositions.get(buyPositionKey);
+    const sellPosition = strategyPositions.get(sellPositionKey);
+
+    if (!buyPosition && !sellPosition) {
+      console.log('⚠️ No open position found for reversal');
+      return res.json({
+        success: true,
+        message: 'No open position to reverse',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const productsResponse = await axios.get(`${account.baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    const product = productsResponse.data.result.find(p => p.symbol === symbol);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    const closeResults = [];
+    let reversedQty = 0;
+
+    // Close buy position and enter reverse (sell)
+    if (buyPosition) {
+      const closePayload = {
+        product_id: product.id,
+        side: 'sell',
+        order_type: 'market_order',
+        size: buyPosition.size
+      };
+
+      const payload = JSON.stringify(closePayload);
+      const endpoint = '/v2/orders';
+      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+      const closeResponse = await axios.post(
+        `${account.baseUrl}${endpoint}`,
+        closePayload,
+        { headers, timeout: 10000 }
+      );
+
+      if (closeResponse.data.success) {
+        strategyPositions.delete(buyPositionKey);
+        reversedQty = buyPosition.size;
+        closeResults.push({ side: 'buy', size: buyPosition.size, closed: true });
+      }
+    }
+
+    // Close sell position and enter reverse (buy)
+    if (sellPosition) {
+      const closePayload = {
+        product_id: product.id,
+        side: 'buy',
+        order_type: 'market_order',
+        size: sellPosition.size
+      };
+
+      const payload = JSON.stringify(closePayload);
+      const endpoint = '/v2/orders';
+      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+      const closeResponse = await axios.post(
+        `${account.baseUrl}${endpoint}`,
+        closePayload,
+        { headers, timeout: 10000 }
+      );
+
+      if (closeResponse.data.success) {
+        strategyPositions.delete(sellPositionKey);
+        reversedQty = sellPosition.size;
+        closeResults.push({ side: 'sell', size: sellPosition.size, closed: true });
+      }
+    }
+
+    // Enter reverse position
+    if (reversedQty > 0) {
+      const entryQty = quantity ? parseInt(quantity) : reversedQty;
+      const reverseSide = buyPosition ? 'sell' : 'buy';
+
+      const entryPayload = {
+        product_id: product.id,
+        side: reverseSide,
+        order_type: 'market_order',
+        size: entryQty
+      };
+
+      const payload = JSON.stringify(entryPayload);
+      const endpoint = '/v2/orders';
+      const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+      const entryResponse = await axios.post(
+        `${account.baseUrl}${endpoint}`,
+        entryPayload,
+        { headers, timeout: 10000 }
+      );
+
+      if (entryResponse.data.success) {
+        const order = entryResponse.data.result;
+        const newPositionKey = getPositionKey(accountToken, strategyTag, symbol, reverseSide);
+
+        strategyPositions.set(newPositionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: reverseSide,
+          size: entryQty,
+          orderIds: [order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+
+        closeResults.push({ side: reverseSide, size: entryQty, opened: true });
+      }
+    }
+
+    console.log(`✅ Stop and reverse completed`);
+
+    return res.json({
+      success: true,
+      message: 'Stop and reverse processed',
+      results: closeResults,
+      accountToken,
+      strategyTag,
+      symbol
+    });
+
+  } catch (error) {
+    console.error('❌ Stop and reverse error:', error.message);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// Handle generic EXIT signal
 async function handleExitSignal(accountToken, strategyTag, symbol, res) {
   try {
     console.log(`🚪 Processing EXIT signal`);
@@ -1797,6 +2285,829 @@ app.get('/api/product/:productId', validateSession, async (req, res) => {
     });
   }
 });
+// ========================================
+// 📡 ENHANCED TRADINGVIEW WEBHOOK - ALL MESSAGE TYPES
+// ========================================
+
+app.post('/api/webhook/tradingview', async (req, res) => {
+  try {
+    const payload = req.body;
+    
+    console.log('📡 TradingView Webhook Received:');
+    console.log(JSON.stringify(payload, null, 2));
+
+    const { account_token, strategy_tag, signal, symbol, quantity, exit_quantity } = payload;
+
+    // Validate required fields
+    if (!account_token || !strategy_tag || !signal || !symbol) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: account_token, strategy_tag, signal, symbol'
+      });
+    }
+
+    // Validate account token
+    const account = deltaAccounts.get(account_token);
+    if (!account) {
+      console.error(`❌ Invalid account token: ${account_token}`);
+      return res.status(404).json({
+        success: false,
+        error: 'Invalid account token'
+      });
+    }
+
+    console.log(`✅ Account validated: ${account.accountLabel}`);
+    account.lastUsed = new Date();
+
+    const normalizedSignal = signal.toUpperCase();
+
+    // Route to appropriate handler based on signal type
+    switch (normalizedSignal) {
+      case 'BUY':
+        return await handleBuySignal(account_token, strategy_tag, symbol, quantity, account, res);
+      
+      case 'SELL':
+        return await handleSellSignal(account_token, strategy_tag, symbol, quantity, account, res);
+      
+      case 'BUY_EXIT':
+      case 'EXIT_BUY':
+        return await handleBuyExitSignal(account_token, strategy_tag, symbol, exit_quantity, account, res);
+      
+      case 'SELL_EXIT':
+      case 'EXIT_SELL':
+        return await handleSellExitSignal(account_token, strategy_tag, symbol, exit_quantity, account, res);
+      
+      case 'EXIT':
+      case 'EXIT_ALL':
+        return await handleExitAllSignal(account_token, strategy_tag, symbol, account, res);
+      
+      case 'STOP_AND_REVERSE':
+      case 'REVERSE':
+        return await handleStopAndReverseSignal(account_token, strategy_tag, symbol, quantity, account, res);
+      
+      default:
+        return res.status(400).json({
+          success: false,
+          error: `Invalid signal type: ${signal}. Valid types: BUY, SELL, BUY_EXIT, SELL_EXIT, EXIT, STOP_AND_REVERSE`
+        });
+    }
+
+  } catch (error) {
+    console.error('❌ Webhook error:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ========================================
+// 🔵 BUY SIGNAL HANDLER
+// ========================================
+async function handleBuySignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`🔵 Processing BUY signal for ${symbol}`);
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    let orderSize = quantity ? parseInt(quantity) : 1;
+    if (orderSize <= 0) orderSize = 1;
+
+    const orderPayload = {
+      product_id: product.id,
+      side: 'buy',
+      order_type: 'market_order',
+      size: orderSize
+    };
+
+    const result = await placeOrder(orderPayload, account);
+
+    if (result.success) {
+      // Track order metadata
+      orderMetadata.set(result.order.id, {
+        accountToken,
+        strategyTag,
+        symbol,
+        side: 'buy',
+        size: orderSize,
+        orderId: result.order.id,
+        timestamp: new Date()
+      });
+
+      // Update position tracking
+      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+      
+      if (strategyPositions.has(positionKey)) {
+        const existingPos = strategyPositions.get(positionKey);
+        existingPos.size += orderSize;
+        existingPos.orderIds.push(result.order.id);
+        existingPos.lastUpdated = new Date();
+      } else {
+        strategyPositions.set(positionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: 'buy',
+          size: orderSize,
+          orderIds: [result.order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+      }
+
+      // Update strategy tracking
+      updateStrategyTracking(accountToken, strategyTag, symbol);
+
+      console.log(`✅ BUY order placed successfully: ${result.order.id}`);
+
+      return res.json({
+        success: true,
+        message: 'BUY order placed successfully',
+        order: {
+          orderId: result.order.id,
+          symbol,
+          side: 'buy',
+          size: orderSize,
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ BUY signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// 🔴 SELL SIGNAL HANDLER
+// ========================================
+async function handleSellSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`🔴 Processing SELL signal for ${symbol}`);
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    let orderSize = quantity ? parseInt(quantity) : 1;
+    if (orderSize <= 0) orderSize = 1;
+
+    const orderPayload = {
+      product_id: product.id,
+      side: 'sell',
+      order_type: 'market_order',
+      size: orderSize
+    };
+
+    const result = await placeOrder(orderPayload, account);
+
+    if (result.success) {
+      // Track order metadata
+      orderMetadata.set(result.order.id, {
+        accountToken,
+        strategyTag,
+        symbol,
+        side: 'sell',
+        size: orderSize,
+        orderId: result.order.id,
+        timestamp: new Date()
+      });
+
+      // Update position tracking
+      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+      
+      if (strategyPositions.has(positionKey)) {
+        const existingPos = strategyPositions.get(positionKey);
+        existingPos.size += orderSize;
+        existingPos.orderIds.push(result.order.id);
+        existingPos.lastUpdated = new Date();
+      } else {
+        strategyPositions.set(positionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: 'sell',
+          size: orderSize,
+          orderIds: [result.order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+      }
+
+      // Update strategy tracking
+      updateStrategyTracking(accountToken, strategyTag, symbol);
+
+      console.log(`✅ SELL order placed successfully: ${result.order.id}`);
+
+      return res.json({
+        success: true,
+        message: 'SELL order placed successfully',
+        order: {
+          orderId: result.order.id,
+          symbol,
+          side: 'sell',
+          size: orderSize,
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ SELL signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// 🔵❌ BUY EXIT SIGNAL HANDLER (PARTIAL SUPPORT)
+// ========================================
+async function handleBuyExitSignal(accountToken, strategyTag, symbol, exitQuantity, account, res) {
+  try {
+    console.log(`🔵❌ Processing BUY_EXIT signal for ${symbol}`);
+
+    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const buyPosition = strategyPositions.get(buyPositionKey);
+
+    if (!buyPosition) {
+      console.log('⚠️ No BUY position found to exit');
+      return res.json({
+        success: true,
+        message: 'No BUY position to exit',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    // Determine exit quantity
+    let exitSize = exitQuantity ? parseInt(exitQuantity) : buyPosition.size;
+    
+    // Ensure we don't exit more than we have
+    if (exitSize > buyPosition.size) {
+      exitSize = buyPosition.size;
+    }
+
+    console.log(`   Current BUY position: ${buyPosition.size}`);
+    console.log(`   Exiting quantity: ${exitSize}`);
+
+    const closePayload = {
+      product_id: product.id,
+      side: 'sell',
+      order_type: 'market_order',
+      size: exitSize,
+      reduce_only: true
+    };
+
+    const result = await placeOrder(closePayload, account);
+
+    if (result.success) {
+      // Update position tracking
+      buyPosition.size -= exitSize;
+      buyPosition.lastUpdated = new Date();
+
+      // If position fully closed, remove it
+      if (buyPosition.size <= 0) {
+        strategyPositions.delete(buyPositionKey);
+        console.log(`   ✅ BUY position fully closed`);
+      } else {
+        console.log(`   ✅ Partial BUY exit: ${exitSize} closed, ${buyPosition.size} remaining`);
+      }
+
+      return res.json({
+        success: true,
+        message: 'BUY_EXIT executed successfully',
+        exit: {
+          orderId: result.order.id,
+          symbol,
+          side: 'buy_exit',
+          exitedSize: exitSize,
+          remainingSize: buyPosition.size > 0 ? buyPosition.size : 0,
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ BUY_EXIT signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// 🔴❌ SELL EXIT SIGNAL HANDLER (PARTIAL SUPPORT)
+// ========================================
+async function handleSellExitSignal(accountToken, strategyTag, symbol, exitQuantity, account, res) {
+  try {
+    console.log(`🔴❌ Processing SELL_EXIT signal for ${symbol}`);
+
+    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+    const sellPosition = strategyPositions.get(sellPositionKey);
+
+    if (!sellPosition) {
+      console.log('⚠️ No SELL position found to exit');
+      return res.json({
+        success: true,
+        message: 'No SELL position to exit',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    // Determine exit quantity
+    let exitSize = exitQuantity ? parseInt(exitQuantity) : sellPosition.size;
+    
+    // Ensure we don't exit more than we have
+    if (exitSize > sellPosition.size) {
+      exitSize = sellPosition.size;
+    }
+
+    console.log(`   Current SELL position: ${sellPosition.size}`);
+    console.log(`   Exiting quantity: ${exitSize}`);
+
+    const closePayload = {
+      product_id: product.id,
+      side: 'buy',
+      order_type: 'market_order',
+      size: exitSize,
+      reduce_only: true
+    };
+
+    const result = await placeOrder(closePayload, account);
+
+    if (result.success) {
+      // Update position tracking
+      sellPosition.size -= exitSize;
+      sellPosition.lastUpdated = new Date();
+
+      // If position fully closed, remove it
+      if (sellPosition.size <= 0) {
+        strategyPositions.delete(sellPositionKey);
+        console.log(`   ✅ SELL position fully closed`);
+      } else {
+        console.log(`   ✅ Partial SELL exit: ${exitSize} closed, ${sellPosition.size} remaining`);
+      }
+
+      return res.json({
+        success: true,
+        message: 'SELL_EXIT executed successfully',
+        exit: {
+          orderId: result.order.id,
+          symbol,
+          side: 'sell_exit',
+          exitedSize: exitSize,
+          remainingSize: sellPosition.size > 0 ? sellPosition.size : 0,
+          accountToken,
+          strategyTag
+        }
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ SELL_EXIT signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// ❌ EXIT ALL SIGNAL HANDLER
+// ========================================
+async function handleExitAllSignal(accountToken, strategyTag, symbol, account, res) {
+  try {
+    console.log(`❌ Processing EXIT_ALL signal for ${symbol}`);
+
+    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+
+    const buyPosition = strategyPositions.get(buyPositionKey);
+    const sellPosition = strategyPositions.get(sellPositionKey);
+
+    if (!buyPosition && !sellPosition) {
+      console.log('⚠️ No positions found to exit');
+      return res.json({
+        success: true,
+        message: 'No positions to exit',
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    const closedPositions = [];
+
+    // Close BUY position
+    if (buyPosition) {
+      const closePayload = {
+        product_id: product.id,
+        side: 'sell',
+        order_type: 'market_order',
+        size: buyPosition.size,
+        reduce_only: true
+      };
+
+      const result = await placeOrder(closePayload, account);
+      if (result.success) {
+        strategyPositions.delete(buyPositionKey);
+        closedPositions.push({ 
+          side: 'buy', 
+          size: buyPosition.size,
+          orderId: result.order.id
+        });
+        console.log(`   ✅ BUY position closed: ${buyPosition.size}`);
+      }
+    }
+
+    // Close SELL position
+    if (sellPosition) {
+      const closePayload = {
+        product_id: product.id,
+        side: 'buy',
+        order_type: 'market_order',
+        size: sellPosition.size,
+        reduce_only: true
+      };
+
+      const result = await placeOrder(closePayload, account);
+      if (result.success) {
+        strategyPositions.delete(sellPositionKey);
+        closedPositions.push({ 
+          side: 'sell', 
+          size: sellPosition.size,
+          orderId: result.order.id
+        });
+        console.log(`   ✅ SELL position closed: ${sellPosition.size}`);
+      }
+    }
+
+    console.log(`✅ EXIT_ALL completed: ${closedPositions.length} position(s) closed`);
+
+    return res.json({
+      success: true,
+      message: 'EXIT_ALL signal processed',
+      closedPositions,
+      accountToken,
+      strategyTag,
+      symbol
+    });
+
+  } catch (error) {
+    console.error('❌ EXIT_ALL signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// 🔄 STOP AND REVERSE SIGNAL HANDLER
+// ========================================
+async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+  try {
+    console.log(`🔄 Processing STOP_AND_REVERSE signal for ${symbol}`);
+
+    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+
+    const buyPosition = strategyPositions.get(buyPositionKey);
+    const sellPosition = strategyPositions.get(sellPositionKey);
+
+    const product = await getProductBySymbol(symbol, account.baseUrl);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        error: `Symbol ${symbol} not found`
+      });
+    }
+
+    let orderSize = quantity ? parseInt(quantity) : 1;
+    if (orderSize <= 0) orderSize = 1;
+
+    const actions = [];
+
+    // SCENARIO 1: Currently in BUY position → Exit BUY → Enter SELL
+    if (buyPosition) {
+      console.log(`   📊 Current: BUY position (${buyPosition.size})`);
+      console.log(`   🔄 Action: Exit BUY → Enter SELL`);
+
+      // Step 1: Close BUY position
+      const closeBuyPayload = {
+        product_id: product.id,
+        side: 'sell',
+        order_type: 'market_order',
+        size: buyPosition.size,
+        reduce_only: true
+      };
+
+      const closeBuyResult = await placeOrder(closeBuyPayload, account);
+      if (closeBuyResult.success) {
+        strategyPositions.delete(buyPositionKey);
+        actions.push({
+          action: 'close_buy',
+          size: buyPosition.size,
+          orderId: closeBuyResult.order.id
+        });
+        console.log(`   ✅ BUY position closed: ${buyPosition.size}`);
+      }
+
+      // Step 2: Open SELL position
+      const openSellPayload = {
+        product_id: product.id,
+        side: 'sell',
+        order_type: 'market_order',
+        size: orderSize
+      };
+
+      const openSellResult = await placeOrder(openSellPayload, account);
+      if (openSellResult.success) {
+        strategyPositions.set(sellPositionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: 'sell',
+          size: orderSize,
+          orderIds: [openSellResult.order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+        actions.push({
+          action: 'open_sell',
+          size: orderSize,
+          orderId: openSellResult.order.id
+        });
+        console.log(`   ✅ SELL position opened: ${orderSize}`);
+      }
+
+      updateStrategyTracking(accountToken, strategyTag, symbol);
+
+      return res.json({
+        success: true,
+        message: 'STOP_AND_REVERSE: BUY → SELL completed',
+        actions,
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    // SCENARIO 2: Currently in SELL position → Exit SELL → Enter BUY
+    if (sellPosition) {
+      console.log(`   📊 Current: SELL position (${sellPosition.size})`);
+      console.log(`   🔄 Action: Exit SELL → Enter BUY`);
+
+      // Step 1: Close SELL position
+      const closeSellPayload = {
+        product_id: product.id,
+        side: 'buy',
+        order_type: 'market_order',
+        size: sellPosition.size,
+        reduce_only: true
+      };
+
+      const closeSellResult = await placeOrder(closeSellPayload, account);
+      if (closeSellResult.success) {
+        strategyPositions.delete(sellPositionKey);
+        actions.push({
+          action: 'close_sell',
+          size: sellPosition.size,
+          orderId: closeSellResult.order.id
+        });
+        console.log(`   ✅ SELL position closed: ${sellPosition.size}`);
+      }
+
+      // Step 2: Open BUY position
+      const openBuyPayload = {
+        product_id: product.id,
+        side: 'buy',
+        order_type: 'market_order',
+        size: orderSize
+      };
+
+      const openBuyResult = await placeOrder(openBuyPayload, account);
+      if (openBuyResult.success) {
+        strategyPositions.set(buyPositionKey, {
+          accountToken,
+          strategyTag,
+          symbol,
+          side: 'buy',
+          size: orderSize,
+          orderIds: [openBuyResult.order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+        actions.push({
+          action: 'open_buy',
+          size: orderSize,
+          orderId: openBuyResult.order.id
+        });
+        console.log(`   ✅ BUY position opened: ${orderSize}`);
+      }
+
+      updateStrategyTracking(accountToken, strategyTag, symbol);
+
+      return res.json({
+        success: true,
+        message: 'STOP_AND_REVERSE: SELL → BUY completed',
+        actions,
+        accountToken,
+        strategyTag,
+        symbol
+      });
+    }
+
+    // SCENARIO 3: No existing position → Just open BUY
+    console.log(`   ⚠️ No existing position found`);
+    console.log(`   🔄 Action: Opening BUY position`);
+
+    const openBuyPayload = {
+      product_id: product.id,
+      side: 'buy',
+      order_type: 'market_order',
+      size: orderSize
+    };
+
+    const openBuyResult = await placeOrder(openBuyPayload, account);
+    if (openBuyResult.success) {
+      strategyPositions.set(buyPositionKey, {
+        accountToken,
+        strategyTag,
+        symbol,
+        side: 'buy',
+        size: orderSize,
+        orderIds: [openBuyResult.order.id],
+        createdAt: new Date(),
+        lastUpdated: new Date()
+      });
+      actions.push({
+        action: 'open_buy',
+        size: orderSize,
+        orderId: openBuyResult.order.id
+      });
+      console.log(`   ✅ BUY position opened: ${orderSize}`);
+    }
+
+    updateStrategyTracking(accountToken, strategyTag, symbol);
+
+    return res.json({
+      success: true,
+      message: 'STOP_AND_REVERSE: No position → BUY opened',
+      actions,
+      accountToken,
+      strategyTag,
+      symbol
+    });
+
+  } catch (error) {
+    console.error('❌ STOP_AND_REVERSE signal error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+}
+
+// ========================================
+// 🛠️ HELPER FUNCTIONS
+// ========================================
+
+async function getProductBySymbol(symbol, baseUrl) {
+  try {
+    const response = await axios.get(`${baseUrl}/v2/products`, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
+    });
+
+    return response.data.result.find(p => p.symbol === symbol);
+  } catch (error) {
+    console.error('❌ Error fetching product:', error.message);
+    return null;
+  }
+}
+
+async function placeOrder(orderPayload, account) {
+  try {
+    const payload = JSON.stringify(orderPayload);
+    const endpoint = '/v2/orders';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+
+    const response = await axios.post(
+      `${account.baseUrl}${endpoint}`,
+      orderPayload,
+      { 
+        headers, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (response.status === 200 && response.data.success) {
+      return {
+        success: true,
+        order: response.data.result
+      };
+    } else {
+      return {
+        success: false,
+        error: response.data.error?.message || 'Order placement failed'
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+function updateStrategyTracking(accountToken, strategyTag, symbol) {
+  if (!accountStrategies.get(accountToken).has(strategyTag)) {
+    accountStrategies.get(accountToken).set(strategyTag, {
+      strategyTag,
+      symbols: new Set([symbol]),
+      totalOrders: 1,
+      createdAt: new Date(),
+      lastActivity: new Date()
+    });
+  } else {
+    const strategy = accountStrategies.get(accountToken).get(strategyTag);
+    strategy.symbols.add(symbol);
+    strategy.totalOrders += 1;
+    strategy.lastActivity = new Date();
+  }
+}
 
 // ========================================
 // 🧹 CLEANUP & ERROR HANDLING
