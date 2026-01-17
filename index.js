@@ -38,21 +38,23 @@ app.use((req, res, next) => {
 // 🔐 DATA STRUCTURES
 // ========================================
 
-// User sessions
+// User sessions (temporary, cleared on logout)
 const userSessions = new Map();
 
-// PHASE 2: Multi-account system
-const deltaAccounts = new Map();
-const accountStrategies = new Map();
-const strategyPositions = new Map();
-const orderMetadata = new Map();
+// REGISTERED USERS (persistent, only admin can remove)
+const registeredUsers = new Map();
 
-// PHASE 3: Signal Provider System
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || '';
+// Admin credentials from environment variables
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'ADMIN_MASTER_KEY';
+const ADMIN_API_SECRET = process.env.ADMIN_API_SECRET || 'ADMIN_MASTER_SECRET';
 const ADMIN_SESSION_ID = 'ADMIN_MASTER_SESSION';
+
+// Signal Provider System
 const masterSignals = new Map();
-const userSubscriptions = new Map();
-const signalExecutions = new Map();
+
+// Strategy tracking (per user)
+const userStrategies = new Map();
+const strategyPositions = new Map();
 
 // ========================================
 // 🔧 UTILITY FUNCTIONS
@@ -106,14 +108,11 @@ function validateSession(req, res, next) {
   next();
 }
 
-function generateAccountToken() {
-  const prefix = 'ACC';
-  const randomPart = crypto.randomBytes(4).toString('hex').toUpperCase();
-  return `${prefix}_${randomPart}`;
-}
-
-function getPositionKey(accountToken, strategyTag, symbol, side) {
-  return `${accountToken}:${strategyTag}:${symbol}:${side}`;
+function generateUserToken() {
+  const prefix = 'USR';
+  const timestamp = Date.now().toString(36).toUpperCase();
+  const random = crypto.randomBytes(4).toString('hex').toUpperCase();
+  return `${prefix}_${timestamp}_${random}`;
 }
 
 function generateSignalId() {
@@ -123,16 +122,20 @@ function generateSignalId() {
   return `${prefix}_${timestamp}_${random}`;
 }
 
+function getPositionKey(userToken, strategyTag, symbol, side) {
+  return `${userToken}:${strategyTag}:${symbol}:${side}`;
+}
+
 function isAdmin(req) {
   const sessionId = req.headers['x-session-id'];
   const session = userSessions.get(sessionId);
   
   return sessionId === ADMIN_SESSION_ID || 
-         (session && session.apiKey === ADMIN_API_KEY);
+         (session && session.isAdmin === true);
 }
 
 // ========================================
-// 🛠️ HELPER FUNCTIONS FOR WEBHOOKS
+// 🛠️ HELPER FUNCTIONS
 // ========================================
 
 async function getProductBySymbol(symbol, baseUrl) {
@@ -149,14 +152,14 @@ async function getProductBySymbol(symbol, baseUrl) {
   }
 }
 
-async function placeOrder(orderPayload, account) {
+async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
   try {
     const payload = JSON.stringify(orderPayload);
     const endpoint = '/v2/orders';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, account.apiKey, account.apiSecret);
+    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
 
     const response = await axios.post(
-      `${account.baseUrl}${endpoint}`,
+      `${baseUrl}${endpoint}`,
       orderPayload,
       { 
         headers, 
@@ -186,9 +189,15 @@ async function placeOrder(orderPayload, account) {
   }
 }
 
-function updateStrategyTracking(accountToken, strategyTag, symbol) {
-  if (!accountStrategies.get(accountToken).has(strategyTag)) {
-    accountStrategies.get(accountToken).set(strategyTag, {
+function updateStrategyTracking(userToken, strategyTag, symbol) {
+  if (!userStrategies.has(userToken)) {
+    userStrategies.set(userToken, new Map());
+  }
+
+  const strategies = userStrategies.get(userToken);
+  
+  if (!strategies.has(strategyTag)) {
+    strategies.set(strategyTag, {
       strategyTag,
       symbols: new Set([symbol]),
       totalOrders: 1,
@@ -196,7 +205,7 @@ function updateStrategyTracking(accountToken, strategyTag, symbol) {
       lastActivity: new Date()
     });
   } else {
-    const strategy = accountStrategies.get(accountToken).get(strategyTag);
+    const strategy = strategies.get(strategyTag);
     strategy.symbols.add(symbol);
     strategy.totalOrders += 1;
     strategy.lastActivity = new Date();
@@ -213,11 +222,8 @@ app.get('/api/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     activeSessions: userSessions.size,
-    totalAccounts: deltaAccounts.size,
-    totalStrategies: Array.from(accountStrategies.values()).reduce((sum, map) => sum + map.size, 0),
-    activePositions: strategyPositions.size,
-    totalSignals: masterSignals.size,
-    totalSubscribers: userSubscriptions.size
+    registeredUsers: registeredUsers.size,
+    totalSignals: masterSignals.size
   });
 });
 
@@ -246,6 +252,9 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
+    // Check if this is admin login
+    const isAdminLogin = apiKey === ADMIN_API_KEY && apiSecret === ADMIN_API_SECRET;
+
     const baseUrl = getBaseUrl(accountType);
     const endpoint = '/v2/profile';
     const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
@@ -262,35 +271,116 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     if (response.status === 200 && response.data.success) {
-      const sessionId = crypto.randomBytes(32).toString('hex');
+      const userInfo = response.data.result;
       
-      const isAdminUser = apiKey === ADMIN_API_KEY;
+      if (isAdminLogin) {
+        // Admin login
+        const sessionId = ADMIN_SESSION_ID;
+        
+        userSessions.set(sessionId, {
+          apiKey,
+          apiSecret,
+          accountType,
+          baseUrl,
+          userInfo,
+          isAdmin: true,
+          userToken: 'ADMIN',
+          createdAt: new Date(),
+          lastActivity: new Date()
+        });
+
+        console.log('👑 ADMIN USER LOGGED IN');
+
+        return res.json({
+          success: true,
+          sessionId,
+          userInfo: {
+            email: userInfo.email,
+            accountName: userInfo.account_name,
+            accountType,
+            marginMode: userInfo.margin_mode,
+            isAdmin: true,
+            userToken: 'ADMIN'
+          }
+        });
+      }
+
+      // Regular user login - Check by email
+      let existingUser = Array.from(registeredUsers.values()).find(
+        u => u.email === userInfo.email && u.accountType === accountType
+      );
+
+      let userToken;
+
+      if (existingUser) {
+        // User exists, check if active
+        if (!existingUser.isActive) {
+          return res.status(403).json({
+            success: false,
+            error: 'Your account has been deactivated by admin. Please contact support.'
+          });
+        }
+
+        userToken = existingUser.userToken;
+        existingUser.lastLogin = new Date();
+        existingUser.apiKey = apiKey;
+        existingUser.apiSecret = apiSecret;
+        
+        console.log(`✅ Existing user logged in: ${userInfo.email} (${userToken})`);
+      } else {
+        // New user - auto-register
+        userToken = generateUserToken();
+        
+        const newUser = {
+          userToken,
+          apiKey,
+          apiSecret,
+          accountType,
+          baseUrl,
+          email: userInfo.email,
+          accountName: userInfo.account_name,
+          registeredAt: new Date(),
+          lastLogin: new Date(),
+          isActive: true
+        };
+
+        registeredUsers.set(userToken, newUser);
+        userStrategies.set(userToken, new Map());
+
+        console.log('='.repeat(70));
+        console.log(`🆕 NEW USER AUTO-REGISTERED!`);
+        console.log(`   Email: ${userInfo.email}`);
+        console.log(`   Token: ${userToken}`);
+        console.log(`   Account Type: ${accountType}`);
+        console.log(`   Total Users: ${registeredUsers.size}`);
+        console.log('='.repeat(70));
+      }
+
+      // Create session
+      const sessionId = crypto.randomBytes(32).toString('hex');
       
       userSessions.set(sessionId, {
         apiKey,
         apiSecret,
         accountType,
         baseUrl,
-        userInfo: response.data.result,
-        isAdmin: isAdminUser,
+        userInfo,
+        isAdmin: false,
+        userToken,
         createdAt: new Date(),
         lastActivity: new Date()
       });
-
-      console.log(`✅ Login successful for user: ${response.data.result.email}`);
-      if (isAdminUser) {
-        console.log('👑 ADMIN USER LOGGED IN');
-      }
 
       res.json({
         success: true,
         sessionId,
         userInfo: {
-          email: response.data.result.email,
-          accountName: response.data.result.account_name,
+          email: userInfo.email,
+          accountName: userInfo.account_name,
           accountType,
-          marginMode: response.data.result.margin_mode,
-          isAdmin: isAdminUser
+          marginMode: userInfo.margin_mode,
+          isAdmin: false,
+          userToken
         }
       });
     } else {
@@ -340,121 +430,46 @@ app.get('/api/auth/validate', validateSession, (req, res) => {
       accountName: req.userSession.userInfo.account_name,
       accountType: req.userSession.accountType,
       marginMode: req.userSession.userInfo.margin_mode,
-      isAdmin: req.userSession.isAdmin || false
+      isAdmin: req.userSession.isAdmin || false,
+      userToken: req.userSession.userToken
     }
   });
 });
 
 // ========================================
-// 🏦 ACCOUNT MANAGEMENT
+// 👥 ADMIN - USER MANAGEMENT
 // ========================================
 
-app.post('/api/accounts/add', validateSession, async (req, res) => {
+app.get('/api/admin/users', validateSession, (req, res) => {
   try {
-    const { apiKey, apiSecret, accountType, accountLabel, ipAddress } = req.body;
-    const sessionId = req.headers['x-session-id'];
-
-    console.log('🏦 Adding new Delta Exchange account...');
-
-    if (!apiKey || !apiSecret || !accountType) {
-      return res.status(400).json({
+    if (!isAdmin(req)) {
+      return res.status(403).json({
         success: false,
-        error: 'API Key, API Secret, and Account Type are required'
+        error: 'Admin access required'
       });
     }
 
-    const baseUrl = getBaseUrl(accountType);
-    const endpoint = '/v2/profile';
-    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
+    const users = Array.from(registeredUsers.values()).map(user => ({
+      userToken: user.userToken,
+      email: user.email,
+      accountName: user.accountName,
+      accountType: user.accountType,
+      registeredAt: user.registeredAt,
+      lastLogin: user.lastLogin,
+      isActive: user.isActive,
+      strategiesCount: userStrategies.get(user.userToken)?.size || 0
+    }));
 
-    const response = await axios.get(
-      `${baseUrl}${endpoint}`,
-      { 
-        headers, 
-        timeout: 15000,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      }
-    );
-
-    if (response.status !== 200 || !response.data.success) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid API credentials for Delta Exchange account'
-      });
-    }
-
-    const accountToken = generateAccountToken();
-
-    const accountData = {
-      accountToken,
-      apiKey,
-      apiSecret,
-      accountType,
-      baseUrl,
-      accountLabel: accountLabel || `Account ${deltaAccounts.size + 1}`,
-      ipAddress: ipAddress || 'Not specified',
-      userEmail: response.data.result.email,
-      accountName: response.data.result.account_name,
-      addedBy: sessionId,
-      createdAt: new Date(),
-      lastUsed: new Date()
-    };
-
-    deltaAccounts.set(accountToken, accountData);
-    accountStrategies.set(accountToken, new Map());
-
-    console.log(`✅ Account added successfully: ${accountToken}`);
+    console.log(`📊 Admin fetching users: ${users.length} total users`);
 
     res.json({
       success: true,
-      accountToken,
-      accountData: {
-        accountToken,
-        accountLabel: accountData.accountLabel,
-        accountType: accountData.accountType,
-        userEmail: accountData.userEmail,
-        accountName: accountData.accountName,
-        ipAddress: accountData.ipAddress,
-        createdAt: accountData.createdAt
-      }
+      users,
+      totalUsers: users.length,
+      activeUsers: users.filter(u => u.isActive).length
     });
   } catch (error) {
-    console.error('❌ Error adding account:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to add account'
-    });
-  }
-});
-
-app.get('/api/accounts', validateSession, (req, res) => {
-  try {
-    const sessionId = req.headers['x-session-id'];
-    
-    const userAccounts = Array.from(deltaAccounts.values())
-      .filter(acc => acc.addedBy === sessionId)
-      .map(acc => ({
-        accountToken: acc.accountToken,
-        accountLabel: acc.accountLabel,
-        accountType: acc.accountType,
-        userEmail: acc.userEmail,
-        accountName: acc.accountName,
-        ipAddress: acc.ipAddress,
-        createdAt: acc.createdAt,
-        lastUsed: acc.lastUsed,
-        strategiesCount: accountStrategies.get(acc.accountToken)?.size || 0
-      }));
-
-    res.json({
-      success: true,
-      accounts: userAccounts,
-      totalAccounts: userAccounts.length
-    });
-  } catch (error) {
-    console.error('❌ Error fetching accounts:', error.message);
+    console.error('❌ Error fetching users:', error.message);
     
     res.status(500).json({
       success: false,
@@ -463,163 +478,51 @@ app.get('/api/accounts', validateSession, (req, res) => {
   }
 });
 
-app.delete('/api/accounts/:accountToken', validateSession, (req, res) => {
+app.delete('/api/admin/users/:userToken', validateSession, (req, res) => {
   try {
-    const { accountToken } = req.params;
-    const sessionId = req.headers['x-session-id'];
-
-    const account = deltaAccounts.get(accountToken);
-
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        error: 'Account not found'
-      });
-    }
-
-    if (account.addedBy !== sessionId) {
+    if (!isAdmin(req)) {
       return res.status(403).json({
         success: false,
-        error: 'Unauthorized to delete this account'
+        error: 'Admin access required'
       });
     }
 
-    deltaAccounts.delete(accountToken);
-    accountStrategies.delete(accountToken);
+    const { userToken } = req.params;
+
+    const user = registeredUsers.get(userToken);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Remove user
+    registeredUsers.delete(userToken);
+    userStrategies.delete(userToken);
     
+    // Remove all positions for this user
     for (const [key, pos] of strategyPositions.entries()) {
-      if (pos.accountToken === accountToken) {
+      if (pos.userToken === userToken) {
         strategyPositions.delete(key);
       }
     }
 
-    console.log(`🗑️ Account deleted: ${accountToken}`);
-
-    res.json({
-      success: true,
-      message: 'Account deleted successfully'
-    });
-  } catch (error) {
-    console.error('❌ Error deleting account:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get('/api/accounts/:accountToken/strategies', validateSession, (req, res) => {
-  try {
-    const { accountToken } = req.params;
-
-    const account = deltaAccounts.get(accountToken);
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        error: 'Account not found'
-      });
-    }
-
-    const strategies = accountStrategies.get(accountToken);
-    const strategyList = Array.from(strategies.values()).map(s => ({
-      strategyTag: s.strategyTag,
-      symbols: Array.from(s.symbols),
-      totalOrders: s.totalOrders,
-      createdAt: s.createdAt,
-      lastActivity: s.lastActivity
-    }));
-
-    res.json({
-      success: true,
-      accountToken,
-      accountLabel: account.accountLabel,
-      strategies: strategyList,
-      totalStrategies: strategyList.length
-    });
-  } catch (error) {
-    console.error('❌ Error fetching strategies:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get('/api/accounts/:accountToken/positions', validateSession, (req, res) => {
-  try {
-    const { accountToken } = req.params;
-    const { strategy_tag } = req.query;
-
-    const account = deltaAccounts.get(accountToken);
-    if (!account) {
-      return res.status(404).json({
-        success: false,
-        error: 'Account not found'
-      });
-    }
-
-    let positions = Array.from(strategyPositions.values())
-      .filter(pos => pos.accountToken === accountToken);
-
-    if (strategy_tag) {
-      positions = positions.filter(pos => pos.strategyTag === strategy_tag);
-    }
-
-    const positionList = positions.map(pos => ({
-      strategyTag: pos.strategyTag,
-      symbol: pos.symbol,
-      side: pos.side,
-      size: pos.size,
-      orderIds: pos.orderIds,
-      createdAt: pos.createdAt,
-      lastUpdated: pos.lastUpdated
-    }));
-
-    res.json({
-      success: true,
-      accountToken,
-      accountLabel: account.accountLabel,
-      positions: positionList,
-      totalPositions: positionList.length
-    });
-  } catch (error) {
-    console.error('❌ Error fetching positions:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get('/api/stats', validateSession, (req, res) => {
-  try {
-    const sessionId = req.headers['x-session-id'];
-    
-    const userAccounts = Array.from(deltaAccounts.values())
-      .filter(acc => acc.addedBy === sessionId);
-
-    const totalStrategies = userAccounts.reduce((sum, acc) => {
-      return sum + (accountStrategies.get(acc.accountToken)?.size || 0);
-    }, 0);
-
-    const totalPositions = Array.from(strategyPositions.values())
-      .filter(pos => userAccounts.some(acc => acc.accountToken === pos.accountToken))
-      .length;
-
-    res.json({
-      success: true,
-      stats: {
-        totalAccounts: userAccounts.length,
-        totalStrategies,
-        totalPositions,
-        totalOrders: orderMetadata.size
+    // Invalidate all sessions for this user
+    for (const [sessionId, session] of userSessions.entries()) {
+      if (session.userToken === userToken) {
+        userSessions.delete(sessionId);
       }
+    }
+
+    console.log(`🗑️ User removed by admin: ${user.email} (${userToken})`);
+
+    res.json({
+      success: true,
+      message: 'User removed successfully'
     });
   } catch (error) {
-    console.error('❌ Error fetching stats:', error.message);
+    console.error('❌ Error removing user:', error.message);
     
     res.status(500).json({
       success: false,
@@ -628,75 +531,45 @@ app.get('/api/stats', validateSession, (req, res) => {
   }
 });
 
-// ========================================
-// 📡 ENHANCED TRADINGVIEW WEBHOOK - ALL MESSAGE TYPES
-// ========================================
-
-app.post('/api/webhook/tradingview', async (req, res) => {
+app.post('/api/admin/users/:userToken/toggle', validateSession, (req, res) => {
   try {
-    const payload = req.body;
-    
-    console.log('📡 TradingView Webhook Received:');
-    console.log(JSON.stringify(payload, null, 2));
-
-    const { account_token, strategy_tag, signal, symbol, quantity, exit_quantity } = payload;
-
-    // Validate required fields
-    if (!account_token || !strategy_tag || !signal || !symbol) {
-      return res.status(400).json({
+    if (!isAdmin(req)) {
+      return res.status(403).json({
         success: false,
-        error: 'Missing required fields: account_token, strategy_tag, signal, symbol'
+        error: 'Admin access required'
       });
     }
 
-    // Validate account token
-    const account = deltaAccounts.get(account_token);
-    if (!account) {
-      console.error(`❌ Invalid account token: ${account_token}`);
+    const { userToken } = req.params;
+
+    const user = registeredUsers.get(userToken);
+    if (!user) {
       return res.status(404).json({
         success: false,
-        error: 'Invalid account token'
+        error: 'User not found'
       });
     }
 
-    console.log(`✅ Account validated: ${account.accountLabel}`);
-    account.lastUsed = new Date();
+    user.isActive = !user.isActive;
 
-    const normalizedSignal = signal.toUpperCase();
-
-    // Route to appropriate handler based on signal type
-    switch (normalizedSignal) {
-      case 'BUY':
-        return await handleBuySignal(account_token, strategy_tag, symbol, quantity, account, res);
-      
-      case 'SELL':
-        return await handleSellSignal(account_token, strategy_tag, symbol, quantity, account, res);
-      
-      case 'BUY_EXIT':
-      case 'EXIT_BUY':
-        return await handleBuyExitSignal(account_token, strategy_tag, symbol, exit_quantity, account, res);
-      
-      case 'SELL_EXIT':
-      case 'EXIT_SELL':
-        return await handleSellExitSignal(account_token, strategy_tag, symbol, exit_quantity, account, res);
-      
-      case 'EXIT':
-      case 'EXIT_ALL':
-        return await handleExitAllSignal(account_token, strategy_tag, symbol, account, res);
-      
-      case 'STOP_AND_REVERSE':
-      case 'REVERSE':
-        return await handleStopAndReverseSignal(account_token, strategy_tag, symbol, quantity, account, res);
-      
-      default:
-        return res.status(400).json({
-          success: false,
-          error: `Invalid signal type: ${signal}. Valid types: BUY, SELL, BUY_EXIT, SELL_EXIT, EXIT, STOP_AND_REVERSE`
-        });
+    // If deactivating, invalidate all sessions
+    if (!user.isActive) {
+      for (const [sessionId, session] of userSessions.entries()) {
+        if (session.userToken === userToken) {
+          userSessions.delete(sessionId);
+        }
+      }
     }
 
+    console.log(`🔄 User ${user.isActive ? 'activated' : 'deactivated'}: ${user.email}`);
+
+    res.json({
+      success: true,
+      message: `User ${user.isActive ? 'activated' : 'deactivated'} successfully`,
+      isActive: user.isActive
+    });
   } catch (error) {
-    console.error('❌ Webhook error:', error.message);
+    console.error('❌ Error toggling user status:', error.message);
     
     res.status(500).json({
       success: false,
@@ -706,18 +579,14 @@ app.post('/api/webhook/tradingview', async (req, res) => {
 });
 
 // ========================================
-// 🔵 BUY SIGNAL HANDLER
+// 🔵 SIGNAL EXECUTION FUNCTIONS
 // ========================================
-async function handleBuySignal(accountToken, strategyTag, symbol, quantity, account, res) {
-  try {
-    console.log(`🔵 Processing BUY signal for ${symbol}`);
 
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+async function executeBuySignal(userToken, strategyTag, symbol, quantity, user) {
+  try {
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
     let orderSize = quantity ? parseInt(quantity) : 1;
@@ -730,22 +599,10 @@ async function handleBuySignal(accountToken, strategyTag, symbol, quantity, acco
       size: orderSize
     };
 
-    const result = await placeOrder(orderPayload, account);
+    const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      // Track order metadata
-      orderMetadata.set(result.order.id, {
-        accountToken,
-        strategyTag,
-        symbol,
-        side: 'buy',
-        size: orderSize,
-        orderId: result.order.id,
-        timestamp: new Date()
-      });
-
-      // Update position tracking
-      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+      const positionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       
       if (strategyPositions.has(positionKey)) {
         const existingPos = strategyPositions.get(positionKey);
@@ -754,7 +611,7 @@ async function handleBuySignal(accountToken, strategyTag, symbol, quantity, acco
         existingPos.lastUpdated = new Date();
       } else {
         strategyPositions.set(positionKey, {
-          accountToken,
+          userToken,
           strategyTag,
           symbol,
           side: 'buy',
@@ -765,52 +622,22 @@ async function handleBuySignal(accountToken, strategyTag, symbol, quantity, acco
         });
       }
 
-      // Update strategy tracking
-      updateStrategyTracking(accountToken, strategyTag, symbol);
+      updateStrategyTracking(userToken, strategyTag, symbol);
 
-      console.log(`✅ BUY order placed successfully: ${result.order.id}`);
-
-      return res.json({
-        success: true,
-        message: 'BUY order placed successfully',
-        order: {
-          orderId: result.order.id,
-          symbol,
-          side: 'buy',
-          size: orderSize,
-          accountToken,
-          strategyTag
-        }
-      });
+      return { success: true, orderId: result.order.id };
     } else {
-      return res.status(400).json({
-        success: false,
-        error: result.error
-      });
+      return { success: false, error: result.error };
     }
-
   } catch (error) {
-    console.error('❌ BUY signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
-// ========================================
-// 🔴 SELL SIGNAL HANDLER
-// ========================================
-async function handleSellSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+async function executeSellSignal(userToken, strategyTag, symbol, quantity, user) {
   try {
-    console.log(`🔴 Processing SELL signal for ${symbol}`);
-
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
     let orderSize = quantity ? parseInt(quantity) : 1;
@@ -823,22 +650,10 @@ async function handleSellSignal(accountToken, strategyTag, symbol, quantity, acc
       size: orderSize
     };
 
-    const result = await placeOrder(orderPayload, account);
+    const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      // Track order metadata
-      orderMetadata.set(result.order.id, {
-        accountToken,
-        strategyTag,
-        symbol,
-        side: 'sell',
-        size: orderSize,
-        orderId: result.order.id,
-        timestamp: new Date()
-      });
-
-      // Update position tracking
-      const positionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+      const positionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
       
       if (strategyPositions.has(positionKey)) {
         const existingPos = strategyPositions.get(positionKey);
@@ -847,7 +662,7 @@ async function handleSellSignal(accountToken, strategyTag, symbol, quantity, acc
         existingPos.lastUpdated = new Date();
       } else {
         strategyPositions.set(positionKey, {
-          accountToken,
+          userToken,
           strategyTag,
           symbol,
           side: 'sell',
@@ -858,78 +673,33 @@ async function handleSellSignal(accountToken, strategyTag, symbol, quantity, acc
         });
       }
 
-      // Update strategy tracking
-      updateStrategyTracking(accountToken, strategyTag, symbol);
+      updateStrategyTracking(userToken, strategyTag, symbol);
 
-      console.log(`✅ SELL order placed successfully: ${result.order.id}`);
-
-      return res.json({
-        success: true,
-        message: 'SELL order placed successfully',
-        order: {
-          orderId: result.order.id,
-          symbol,
-          side: 'sell',
-          size: orderSize,
-          accountToken,
-          strategyTag
-        }
-      });
+      return { success: true, orderId: result.order.id };
     } else {
-      return res.status(400).json({
-        success: false,
-        error: result.error
-      });
+      return { success: false, error: result.error };
     }
-
   } catch (error) {
-    console.error('❌ SELL signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
-// ========================================
-// 🔵❌ BUY EXIT SIGNAL HANDLER (PARTIAL SUPPORT)
-// ========================================
-async function handleBuyExitSignal(accountToken, strategyTag, symbol, exitQuantity, account, res) {
+async function executeBuyExitSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
-    console.log(`🔵❌ Processing BUY_EXIT signal for ${symbol}`);
-
-    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
+    const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
     const buyPosition = strategyPositions.get(buyPositionKey);
 
     if (!buyPosition) {
-      console.log('⚠️ No BUY position found to exit');
-      return res.json({
-        success: true,
-        message: 'No BUY position to exit',
-        accountToken,
-        strategyTag,
-        symbol
-      });
+      return { success: true, message: 'No BUY position to exit' };
     }
 
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
-    // Determine exit quantity
     let exitSize = exitQuantity ? parseInt(exitQuantity) : buyPosition.size;
-    
-    // Ensure we don't exit more than we have
-    if (exitSize > buyPosition.size) {
-      exitSize = buyPosition.size;
-    }
-
-    console.log(`   Current BUY position: ${buyPosition.size}`);
-    console.log(`   Exiting quantity: ${exitSize}`);
+    if (exitSize > buyPosition.size) exitSize = buyPosition.size;
 
     const closePayload = {
       product_id: product.id,
@@ -939,89 +709,41 @@ async function handleBuyExitSignal(accountToken, strategyTag, symbol, exitQuanti
       reduce_only: true
     };
 
-    const result = await placeOrder(closePayload, account);
+    const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      // Update position tracking
       buyPosition.size -= exitSize;
       buyPosition.lastUpdated = new Date();
 
-      // If position fully closed, remove it
       if (buyPosition.size <= 0) {
         strategyPositions.delete(buyPositionKey);
-        console.log(`   ✅ BUY position fully closed`);
-      } else {
-        console.log(`   ✅ Partial BUY exit: ${exitSize} closed, ${buyPosition.size} remaining`);
       }
 
-      return res.json({
-        success: true,
-        message: 'BUY_EXIT executed successfully',
-        exit: {
-          orderId: result.order.id,
-          symbol,
-          side: 'buy_exit',
-          exitedSize: exitSize,
-          remainingSize: buyPosition.size > 0 ? buyPosition.size : 0,
-          accountToken,
-          strategyTag
-        }
-      });
+      return { success: true, orderId: result.order.id };
     } else {
-      return res.status(400).json({
-        success: false,
-        error: result.error
-      });
+      return { success: false, error: result.error };
     }
-
   } catch (error) {
-    console.error('❌ BUY_EXIT signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
-// ========================================
-// 🔴❌ SELL EXIT SIGNAL HANDLER (PARTIAL SUPPORT)
-// ========================================
-async function handleSellExitSignal(accountToken, strategyTag, symbol, exitQuantity, account, res) {
+async function executeSellExitSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
-    console.log(`🔴❌ Processing SELL_EXIT signal for ${symbol}`);
-
-    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+    const sellPositionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
     const sellPosition = strategyPositions.get(sellPositionKey);
 
     if (!sellPosition) {
-      console.log('⚠️ No SELL position found to exit');
-      return res.json({
-        success: true,
-        message: 'No SELL position to exit',
-        accountToken,
-        strategyTag,
-        symbol
-      });
+      return { success: true, message: 'No SELL position to exit' };
     }
 
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
-    // Determine exit quantity
     let exitSize = exitQuantity ? parseInt(exitQuantity) : sellPosition.size;
-    
-    // Ensure we don't exit more than we have
-    if (exitSize > sellPosition.size) {
-      exitSize = sellPosition.size;
-    }
-
-    console.log(`   Current SELL position: ${sellPosition.size}`);
-    console.log(`   Exiting quantity: ${exitSize}`);
+    if (exitSize > sellPosition.size) exitSize = sellPosition.size;
 
     const closePayload = {
       product_id: product.id,
@@ -1031,85 +753,44 @@ async function handleSellExitSignal(accountToken, strategyTag, symbol, exitQuant
       reduce_only: true
     };
 
-    const result = await placeOrder(closePayload, account);
+    const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      // Update position tracking
       sellPosition.size -= exitSize;
       sellPosition.lastUpdated = new Date();
 
-      // If position fully closed, remove it
       if (sellPosition.size <= 0) {
         strategyPositions.delete(sellPositionKey);
-        console.log(`   ✅ SELL position fully closed`);
-      } else {
-        console.log(`   ✅ Partial SELL exit: ${exitSize} closed, ${sellPosition.size} remaining`);
       }
 
-      return res.json({
-        success: true,
-        message: 'SELL_EXIT executed successfully',
-        exit: {
-          orderId: result.order.id,
-          symbol,
-          side: 'sell_exit',
-          exitedSize: exitSize,
-          remainingSize: sellPosition.size > 0 ? sellPosition.size : 0,
-          accountToken,
-          strategyTag
-        }
-      });
+      return { success: true, orderId: result.order.id };
     } else {
-      return res.status(400).json({
-        success: false,
-        error: result.error
-      });
+      return { success: false, error: result.error };
     }
-
   } catch (error) {
-    console.error('❌ SELL_EXIT signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
-// ========================================
-// ❌ EXIT ALL SIGNAL HANDLER
-// ========================================
-async function handleExitAllSignal(accountToken, strategyTag, symbol, account, res) {
+async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
   try {
-    console.log(`❌ Processing EXIT_ALL signal for ${symbol}`);
-
-    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+    const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
+    const sellPositionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
 
     const buyPosition = strategyPositions.get(buyPositionKey);
     const sellPosition = strategyPositions.get(sellPositionKey);
 
     if (!buyPosition && !sellPosition) {
-      console.log('⚠️ No positions found to exit');
-      return res.json({
-        success: true,
-        message: 'No positions to exit',
-        accountToken,
-        strategyTag,
-        symbol
-      });
+      return { success: true, message: 'No positions to exit' };
     }
 
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
-    const closedPositions = [];
+    const closedOrders = [];
 
-    // Close BUY position
     if (buyPosition) {
       const closePayload = {
         product_id: product.id,
@@ -1119,19 +800,13 @@ async function handleExitAllSignal(accountToken, strategyTag, symbol, account, r
         reduce_only: true
       };
 
-      const result = await placeOrder(closePayload, account);
+      const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
       if (result.success) {
         strategyPositions.delete(buyPositionKey);
-        closedPositions.push({ 
-          side: 'buy', 
-          size: buyPosition.size,
-          orderId: result.order.id
-        });
-        console.log(`   ✅ BUY position closed: ${buyPosition.size}`);
+        closedOrders.push(result.order.id);
       }
     }
 
-    // Close SELL position
     if (sellPosition) {
       const closePayload = {
         product_id: product.id,
@@ -1141,70 +816,36 @@ async function handleExitAllSignal(accountToken, strategyTag, symbol, account, r
         reduce_only: true
       };
 
-      const result = await placeOrder(closePayload, account);
+      const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
       if (result.success) {
         strategyPositions.delete(sellPositionKey);
-        closedPositions.push({ 
-          side: 'sell', 
-          size: sellPosition.size,
-          orderId: result.order.id
-        });
-        console.log(`   ✅ SELL position closed: ${sellPosition.size}`);
+        closedOrders.push(result.order.id);
       }
     }
 
-    console.log(`✅ EXIT_ALL completed: ${closedPositions.length} position(s) closed`);
-
-    return res.json({
-      success: true,
-      message: 'EXIT_ALL signal processed',
-      closedPositions,
-      accountToken,
-      strategyTag,
-      symbol
-    });
-
+    return { success: true, orderId: closedOrders.join(',') };
   } catch (error) {
-    console.error('❌ EXIT_ALL signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
-// ========================================
-// 🔄 STOP AND REVERSE SIGNAL HANDLER
-// ========================================
-async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, quantity, account, res) {
+async function executeStopAndReverseSignal(userToken, strategyTag, symbol, quantity, user) {
   try {
-    console.log(`🔄 Processing STOP_AND_REVERSE signal for ${symbol}`);
-
-    const buyPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'buy');
-    const sellPositionKey = getPositionKey(accountToken, strategyTag, symbol, 'sell');
+    const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
+    const sellPositionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
 
     const buyPosition = strategyPositions.get(buyPositionKey);
     const sellPosition = strategyPositions.get(sellPositionKey);
 
-    const product = await getProductBySymbol(symbol, account.baseUrl);
+    const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: `Symbol ${symbol} not found`
-      });
+      return { success: false, error: `Symbol ${symbol} not found` };
     }
 
     let orderSize = quantity ? parseInt(quantity) : 1;
     if (orderSize <= 0) orderSize = 1;
 
-    const actions = [];
-
-    // SCENARIO 1: Currently in BUY position → Exit BUY → Enter SELL
     if (buyPosition) {
-      console.log(`   📊 Current: BUY position (${buyPosition.size})`);
-      console.log(`   🔄 Action: Exit BUY → Enter SELL`);
-
-      // Step 1: Close BUY position
       const closeBuyPayload = {
         product_id: product.id,
         side: 'sell',
@@ -1212,64 +853,32 @@ async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, qua
         size: buyPosition.size,
         reduce_only: true
       };
+      await placeOrder(closeBuyPayload, user.apiKey, user.apiSecret, user.baseUrl);
+      strategyPositions.delete(buyPositionKey);
 
-      const closeBuyResult = await placeOrder(closeBuyPayload, account);
-      if (closeBuyResult.success) {
-        strategyPositions.delete(buyPositionKey);
-        actions.push({
-          action: 'close_buy',
-          size: buyPosition.size,
-          orderId: closeBuyResult.order.id
-        });
-        console.log(`   ✅ BUY position closed: ${buyPosition.size}`);
-      }
-
-      // Step 2: Open SELL position
       const openSellPayload = {
         product_id: product.id,
         side: 'sell',
         order_type: 'market_order',
         size: orderSize
       };
-
-      const openSellResult = await placeOrder(openSellPayload, account);
-      if (openSellResult.success) {
+      const result = await placeOrder(openSellPayload, user.apiKey, user.apiSecret, user.baseUrl);
+      
+      if (result.success) {
         strategyPositions.set(sellPositionKey, {
-          accountToken,
+          userToken,
           strategyTag,
           symbol,
           side: 'sell',
           size: orderSize,
-          orderIds: [openSellResult.order.id],
+          orderIds: [result.order.id],
           createdAt: new Date(),
           lastUpdated: new Date()
         });
-        actions.push({
-          action: 'open_sell',
-          size: orderSize,
-          orderId: openSellResult.order.id
-        });
-        console.log(`   ✅ SELL position opened: ${orderSize}`);
+        updateStrategyTracking(userToken, strategyTag, symbol);
+        return { success: true, orderId: result.order.id };
       }
-
-      updateStrategyTracking(accountToken, strategyTag, symbol);
-
-      return res.json({
-        success: true,
-        message: 'STOP_AND_REVERSE: BUY → SELL completed',
-        actions,
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    // SCENARIO 2: Currently in SELL position → Exit SELL → Enter BUY
-    if (sellPosition) {
-      console.log(`   📊 Current: SELL position (${sellPosition.size})`);
-      console.log(`   🔄 Action: Exit SELL → Enter BUY`);
-
-      // Step 1: Close SELL position
+    } else if (sellPosition) {
       const closeSellPayload = {
         product_id: product.id,
         side: 'buy',
@@ -1277,111 +886,340 @@ async function handleStopAndReverseSignal(accountToken, strategyTag, symbol, qua
         size: sellPosition.size,
         reduce_only: true
       };
+      await placeOrder(closeSellPayload, user.apiKey, user.apiSecret, user.baseUrl);
+      strategyPositions.delete(sellPositionKey);
 
-      const closeSellResult = await placeOrder(closeSellPayload, account);
-      if (closeSellResult.success) {
-        strategyPositions.delete(sellPositionKey);
-        actions.push({
-          action: 'close_sell',
-          size: sellPosition.size,
-          orderId: closeSellResult.order.id
-        });
-        console.log(`   ✅ SELL position closed: ${sellPosition.size}`);
-      }
-
-      // Step 2: Open BUY position
       const openBuyPayload = {
         product_id: product.id,
         side: 'buy',
         order_type: 'market_order',
         size: orderSize
       };
-
-      const openBuyResult = await placeOrder(openBuyPayload, account);
-      if (openBuyResult.success) {
+      const result = await placeOrder(openBuyPayload, user.apiKey, user.apiSecret, user.baseUrl);
+      
+      if (result.success) {
         strategyPositions.set(buyPositionKey, {
-          accountToken,
+          userToken,
           strategyTag,
           symbol,
           side: 'buy',
           size: orderSize,
-          orderIds: [openBuyResult.order.id],
+          orderIds: [result.order.id],
           createdAt: new Date(),
           lastUpdated: new Date()
         });
-        actions.push({
-          action: 'open_buy',
-          size: orderSize,
-          orderId: openBuyResult.order.id
-        });
-        console.log(`   ✅ BUY position opened: ${orderSize}`);
+        updateStrategyTracking(userToken, strategyTag, symbol);
+        return { success: true, orderId: result.order.id };
       }
-
-      updateStrategyTracking(accountToken, strategyTag, symbol);
-
-      return res.json({
-        success: true,
-        message: 'STOP_AND_REVERSE: SELL → BUY completed',
-        actions,
-        accountToken,
-        strategyTag,
-        symbol
-      });
-    }
-
-    // SCENARIO 3: No existing position → Just open BUY
-    console.log(`   ⚠️ No existing position found`);
-    console.log(`   🔄 Action: Opening BUY position`);
-
-    const openBuyPayload = {
-      product_id: product.id,
-      side: 'buy',
-      order_type: 'market_order',
-      size: orderSize
-    };
-
-    const openBuyResult = await placeOrder(openBuyPayload, account);
-    if (openBuyResult.success) {
-      strategyPositions.set(buyPositionKey, {
-        accountToken,
-        strategyTag,
-        symbol,
+    } else {
+      const openBuyPayload = {
+        product_id: product.id,
         side: 'buy',
-        size: orderSize,
-        orderIds: [openBuyResult.order.id],
-        createdAt: new Date(),
-        lastUpdated: new Date()
-      });
-      actions.push({
-        action: 'open_buy',
-        size: orderSize,
-        orderId: openBuyResult.order.id
-      });
-      console.log(`   ✅ BUY position opened: ${orderSize}`);
+        order_type: 'market_order',
+        size: orderSize
+      };
+      const result = await placeOrder(openBuyPayload, user.apiKey, user.apiSecret, user.baseUrl);
+      
+      if (result.success) {
+        strategyPositions.set(buyPositionKey, {
+          userToken,
+          strategyTag,
+          symbol,
+          side: 'buy',
+          size: orderSize,
+          orderIds: [result.order.id],
+          createdAt: new Date(),
+          lastUpdated: new Date()
+        });
+        updateStrategyTracking(userToken, strategyTag, symbol);
+        return { success: true, orderId: result.order.id };
+      }
     }
 
-    updateStrategyTracking(accountToken, strategyTag, symbol);
-
-    return res.json({
-      success: true,
-      message: 'STOP_AND_REVERSE: No position → BUY opened',
-      actions,
-      accountToken,
-      strategyTag,
-      symbol
-    });
-
+    return { success: false, error: 'Failed to execute stop and reverse' };
   } catch (error) {
-    console.error('❌ STOP_AND_REVERSE signal error:', error.message);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    return { success: false, error: error.message };
   }
 }
 
 // ========================================
-// 📜 TRADING ENDPOINTS (Keep existing code)
+// 📡 ADMIN WEBHOOK - BROADCAST TO ALL USERS
+// ========================================
+
+app.post('/api/webhook/admin', async (req, res) => {
+  try {
+    const payload = req.body;
+    
+    console.log('📡 Admin Webhook Received:');
+    console.log(JSON.stringify(payload, null, 2));
+
+    const { signal, symbol, quantity, strategy_tag, exit_quantity } = payload;
+
+    // Validate required fields
+    if (!signal || !symbol || !strategy_tag) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: signal, symbol, strategy_tag'
+      });
+    }
+
+    const normalizedSignal = signal.toUpperCase();
+
+    // Get all active users
+    const activeUsers = Array.from(registeredUsers.values()).filter(u => u.isActive);
+
+    if (activeUsers.length === 0) {
+      console.log('⚠️ No active users to broadcast to');
+      return res.json({
+        success: true,
+        message: 'No active users to broadcast to',
+        executionResults: []
+      });
+    }
+
+    console.log(`📢 Broadcasting ${normalizedSignal} signal to ${activeUsers.length} users...`);
+
+    const executionResults = [];
+
+    // Execute signal on all active users
+    for (const user of activeUsers) {
+      try {
+        let result;
+
+        switch (normalizedSignal) {
+          case 'BUY':
+            result = await executeBuySignal(user.userToken, strategy_tag, symbol, quantity, user);
+            break;
+          
+          case 'SELL':
+            result = await executeSellSignal(user.userToken, strategy_tag, symbol, quantity, user);
+            break;
+          
+          case 'BUY_EXIT':
+          case 'EXIT_BUY':
+            result = await executeBuyExitSignal(user.userToken, strategy_tag, symbol, exit_quantity, user);
+            break;
+          
+          case 'SELL_EXIT':
+          case 'EXIT_SELL':
+            result = await executeSellExitSignal(user.userToken, strategy_tag, symbol, exit_quantity, user);
+            break;
+          
+          case 'EXIT':
+          case 'EXIT_ALL':
+            result = await executeExitAllSignal(user.userToken, strategy_tag, symbol, user);
+            break;
+          
+          case 'STOP_AND_REVERSE':
+          case 'REVERSE':
+            result = await executeStopAndReverseSignal(user.userToken, strategy_tag, symbol, quantity, user);
+            break;
+          
+          default:
+            result = { success: false, error: 'Invalid signal type' };
+        }
+
+        executionResults.push({
+          userToken: user.userToken,
+          email: user.email,
+          success: result.success,
+          orderId: result.orderId,
+          error: result.error
+        });
+
+        console.log(`  ${result.success ? '✅' : '❌'} ${user.email}: ${result.success ? 'Success' : result.error}`);
+
+      } catch (error) {
+        executionResults.push({
+          userToken: user.userToken,
+          email: user.email,
+          success: false,
+          error: error.message
+        });
+        console.log(`  ❌ ${user.email}: ${error.message}`);
+      }
+    }
+
+    // Save signal to history
+    const signalId = generateSignalId();
+    const signal_data = {
+      signalId,
+      signal_type: normalizedSignal,
+      symbol,
+      quantity: quantity || 1,
+      strategy_name: strategy_tag,
+      description: `Webhook signal from TradingView`,
+      created_at: new Date(),
+      execution_count: executionResults.length,
+      success_count: executionResults.filter(r => r.success).length,
+      executionResults,
+      source: 'webhook'
+    };
+
+    masterSignals.set(signalId, signal_data);
+
+    const successCount = executionResults.filter(r => r.success).length;
+    console.log(`✅ Webhook broadcast completed: ${successCount}/${executionResults.length} successful`);
+
+    res.json({
+      success: true,
+      message: `Signal broadcasted to ${activeUsers.length} users`,
+      signalId,
+      signal_type: normalizedSignal,
+      symbol,
+      strategy_tag,
+      execution_count: executionResults.length,
+      success_count: successCount,
+      executionResults
+    });
+
+  } catch (error) {
+    console.error('❌ Admin webhook error:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ========================================
+// 📡 ADMIN - SIGNAL MANAGEMENT
+// ========================================
+
+app.get('/api/admin/signals', validateSession, (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      });
+    }
+
+    const signals = Array.from(masterSignals.values())
+      .sort((a, b) => b.created_at - a.created_at)
+      .map(signal => ({
+        signalId: signal.signalId,
+        signal_type: signal.signal_type,
+        symbol: signal.symbol,
+        quantity: signal.quantity,
+        strategy_name: signal.strategy_name,
+        description: signal.description,
+        created_at: signal.created_at,
+        execution_count: signal.execution_count,
+        success_count: signal.success_count,
+        success_rate: signal.execution_count > 0 
+          ? ((signal.success_count / signal.execution_count) * 100).toFixed(1)
+          : '0.0',
+        source: signal.source || 'manual',
+        executionResults: signal.executionResults
+      }));
+
+    res.json({
+      success: true,
+      signals,
+      statistics: {
+        totalSignals: signals.length,
+        totalExecutions: signals.reduce((sum, s) => sum + s.execution_count, 0),
+        totalSuccesses: signals.reduce((sum, s) => sum + s.success_count, 0)
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching signals:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.delete('/api/admin/signals/:signalId', validateSession, (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      });
+    }
+
+    const { signalId } = req.params;
+
+    if (!masterSignals.has(signalId)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Signal not found'
+      });
+    }
+
+    masterSignals.delete(signalId);
+
+    res.json({
+      success: true,
+      message: 'Signal deleted successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error deleting signal:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ========================================
+// 👤 USER - VIEW SIGNALS (Read-only)
+// ========================================
+
+app.get('/api/user/signals', validateSession, (req, res) => {
+  try {
+    if (isAdmin(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'This endpoint is for regular users only'
+      });
+    }
+
+    const signals = Array.from(masterSignals.values())
+      .sort((a, b) => b.created_at - a.created_at)
+      .slice(0, 50)
+      .map(signal => {
+        const userToken = req.userSession.userToken;
+        const userExecution = signal.executionResults?.find(r => r.userToken === userToken);
+
+        return {
+          signalId: signal.signalId,
+          signal_type: signal.signal_type,
+          symbol: signal.symbol,
+          quantity: signal.quantity,
+          strategy_name: signal.strategy_name,
+          description: signal.description,
+          created_at: signal.created_at,
+          userExecution: userExecution ? {
+            success: userExecution.success,
+            orderId: userExecution.orderId,
+            error: userExecution.error
+          } : null
+        };
+      });
+
+    res.json({
+      success: true,
+      signals
+    });
+  } catch (error) {
+    console.error('❌ Error fetching user signals:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ========================================
+// 📜 MANUAL TRADING ENDPOINTS
 // ========================================
 
 app.get('/api/symbols', validateSession, async (req, res) => {
@@ -1518,24 +1356,71 @@ app.post('/api/position/close', validateSession, async (req, res) => {
     const { product_id } = req.body;
     const { apiKey, apiSecret, baseUrl } = req.userSession;
 
-    const closePayload = {
-      product_id: parseInt(product_id)
-    };
+    const endpoint = '/v2/positions';
+    const queryString = `?product_id=${product_id}`;
+    const headers = getAuthHeaders('GET', endpoint, queryString, '', apiKey, apiSecret);
 
-    const payload = JSON.stringify(closePayload);
-    const endpoint = '/v2/positions/close_all';
-    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
-
-    const response = await axios.post(
-      `${baseUrl}${endpoint}`,
-      closePayload,
+    const positionResponse = await axios.get(
+      `${baseUrl}${endpoint}${queryString}`,
       { headers, timeout: 10000 }
     );
 
-    res.json({
-      success: true,
-      result: response.data.result
-    });
+    if (!positionResponse.data.success || !positionResponse.data.result) {
+      return res.status(404).json({
+        success: false,
+        error: 'No position found for this product'
+      });
+    }
+
+    const position = positionResponse.data.result;
+    const positionSize = position.size;
+
+    if (positionSize === 0) {
+      return res.json({
+        success: true,
+        message: 'No open position to close'
+      });
+    }
+
+    const closeSide = positionSize > 0 ? 'sell' : 'buy';
+    const closeSize = Math.abs(positionSize);
+
+    const closeOrderPayload = {
+      product_id: parseInt(product_id),
+      side: closeSide,
+      order_type: 'market_order',
+      size: closeSize,
+      reduce_only: true
+    };
+
+    const payload = JSON.stringify(closeOrderPayload);
+    const orderEndpoint = '/v2/orders';
+    const orderHeaders = getAuthHeaders('POST', orderEndpoint, '', payload, apiKey, apiSecret);
+
+    const orderResponse = await axios.post(
+      `${baseUrl}${orderEndpoint}`,
+      closeOrderPayload,
+      { 
+        headers: orderHeaders, 
+        timeout: 10000,
+        validateStatus: function (status) {
+          return status < 500;
+        }
+      }
+    );
+
+    if (orderResponse.status === 200 && orderResponse.data.success) {
+      res.json({
+        success: true,
+        message: 'Position closed successfully',
+        order: orderResponse.data.result
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: orderResponse.data.error?.message || 'Failed to close position'
+      });
+    }
   } catch (error) {
     console.error('❌ Error closing position:', error.message);
     
@@ -1638,31 +1523,6 @@ app.get('/api/account', validateSession, async (req, res) => {
   }
 });
 
-app.get('/api/wallet', validateSession, async (req, res) => {
-  try {
-    const { apiKey, apiSecret, baseUrl } = req.userSession;
-    const endpoint = '/v2/wallet/balances';
-    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
-
-    const response = await axios.get(
-      `${baseUrl}${endpoint}`,
-      { headers, timeout: 10000 }
-    );
-
-    res.json({
-      success: true,
-      balances: response.data.result
-    });
-  } catch (error) {
-    console.error('❌ Error fetching wallet:', error.message);
-    
-    res.status(500).json({
-      success: false,
-      error: error.response?.data?.error?.message || error.message
-    });
-  }
-});
-
 app.get('/api/market-data', validateSession, async (req, res) => {
   try {
     const { symbol } = req.query;
@@ -1711,6 +1571,31 @@ app.get('/api/product/:productId', validateSession, async (req, res) => {
   }
 });
 
+app.get('/api/wallet', validateSession, async (req, res) => {
+  try {
+    const { apiKey, apiSecret, baseUrl } = req.userSession;
+    const endpoint = '/v2/wallet/balances';
+    const headers = getAuthHeaders('GET', endpoint, '', '', apiKey, apiSecret);
+
+    const response = await axios.get(
+      `${baseUrl}${endpoint}`,
+      { headers, timeout: 10000 }
+    );
+
+    res.json({
+      success: true,
+      balances: response.data.result
+    });
+  } catch (error) {
+    console.error('❌ Error fetching wallet:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || error.message
+    });
+  }
+});
+
 // ========================================
 // 🧹 CLEANUP & ERROR HANDLING
 // ========================================
@@ -1738,21 +1623,23 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log('='.repeat(70));
-  console.log('🚀 Delta Trading Bridge - PHASE 2 ENHANCED: ALL WEBHOOK TYPES');
+  console.log('🚀 Delta Trading Bridge - SIGNAL FOLLOWING + MANUAL TRADING');
   console.log('='.repeat(70));
   console.log(`📡 Server running on: http://localhost:${PORT}`);
   console.log(`🔐 Session-based authentication enabled`);
-  console.log(`🏦 Multi-account support with token-based routing`);
-  console.log(`🏷️  Strategy-level isolation and tracking`);
-  console.log(`📊 TradingView webhook endpoint: /api/webhook/tradingview`);
+  console.log(`👥 Auto-registration on first login`);
+  console.log(`👑 Admin webhook broadcasts to all users`);
+  console.log(`📊 Manual trading enabled for all users`);
   console.log('='.repeat(70));
-  console.log('✅ SUPPORTED WEBHOOK SIGNALS:');
-  console.log('   1. BUY - Open long position');
-  console.log('   2. SELL - Open short position');
-  console.log('   3. BUY_EXIT - Close long position (full/partial)');
-  console.log('   4. SELL_EXIT - Close short position (full/partial)');
-  console.log('   5. EXIT - Close all positions');
-  console.log('   6. STOP_AND_REVERSE - Reverse position direction');
+  console.log('✅ ADMIN CREDENTIALS:');
+  console.log(`   API Key: ${ADMIN_API_KEY}`);
+  console.log(`   API Secret: ${ADMIN_API_SECRET}`);
+  console.log('='.repeat(70));
+  console.log('✅ ADMIN WEBHOOK ENDPOINT:');
+  console.log(`   POST /api/webhook/admin`);
+  console.log('='.repeat(70));
+  console.log('✅ SUPPORTED SIGNALS:');
+  console.log('   BUY, SELL, EXIT, BUY_EXIT, SELL_EXIT, STOP_AND_REVERSE');
   console.log('='.repeat(70));
   console.log('');
 });
