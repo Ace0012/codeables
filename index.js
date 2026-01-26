@@ -12,7 +12,7 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['http://localhost:3000', 'http://localhost:3001'];
 
 // ========================================
-// 🔧 CORS CONFIGURATION - FIXED FOR WEBHOOKS
+// 🔧 CORS CONFIGURATION
 // ========================================
 
 const corsOptions = {
@@ -154,7 +154,7 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
     const endpoint = '/v2/orders';
     const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
 
-    console.log(`📤 Placing order:`, orderPayload);
+    console.log(`   📤 Placing order:`, JSON.stringify(orderPayload, null, 2));
 
     const response = await axios.post(`${baseUrl}${endpoint}`, orderPayload, {
       headers,
@@ -162,18 +162,23 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
       validateStatus: (status) => status < 500
     });
 
-    console.log(`📥 Order response:`, response.data);
+    console.log(`   📥 Response Status: ${response.status}`);
+    console.log(`   📥 Response Data:`, JSON.stringify(response.data, null, 2));
 
     if (response.status === 200 && response.data.success) {
       return { success: true, order: response.data.result };
     } else {
-      const errorMsg = response.data.error?.message || response.data.error || 'Order placement failed';
-      console.error(`❌ Order failed:`, errorMsg);
+      const errorMsg = response.data.error?.message || response.data.error || JSON.stringify(response.data);
+      console.error(`   ❌ Order failed:`, errorMsg);
       return { success: false, error: errorMsg };
     }
   } catch (error) {
-    console.error(`❌ Order exception:`, error.message);
-    return { success: false, error: error.message };
+    console.error(`   ❌ Order exception:`, error.message);
+    if (error.response) {
+      console.error(`   Response Status:`, error.response.status);
+      console.error(`   Response Data:`, JSON.stringify(error.response.data, null, 2));
+    }
+    return { success: false, error: error.response?.data?.error?.message || error.message };
   }
 }
 
@@ -199,20 +204,23 @@ function updateStrategyTracking(userToken, strategyTag, symbol) {
 }
 
 function calculateVolume(volumeValue, volumeType, accountBalance, currentPrice) {
-  if (!volumeType || volumeType === 'volume') return parseInt(volumeValue);
+  if (!volumeType || volumeType === 'volume') {
+    const parsed = parseFloat(volumeValue);
+    return Math.floor(parsed) > 0 ? Math.floor(parsed) : 1;
+  }
   if (volumeType === 'USD') {
-    if (!currentPrice || currentPrice <= 0) return parseInt(volumeValue);
+    if (!currentPrice || currentPrice <= 0) return 1;
     const calculatedLots = Math.floor(volumeValue / currentPrice);
     return calculatedLots > 0 ? calculatedLots : 1;
   }
   if (volumeType === 'equity_percent') {
-    if (!accountBalance || accountBalance <= 0) return parseInt(volumeValue);
+    if (!accountBalance || accountBalance <= 0) return 1;
     const tradingAmount = (accountBalance * volumeValue) / 100;
-    if (!currentPrice || currentPrice <= 0) return parseInt(volumeValue);
+    if (!currentPrice || currentPrice <= 0) return 1;
     const calculatedLots = Math.floor(tradingAmount / currentPrice);
     return calculatedLots > 0 ? calculatedLots : 1;
   }
-  return parseInt(volumeValue);
+  return 1;
 }
 
 const ACTION_MAPPINGS = {
@@ -230,7 +238,7 @@ const ACTION_MAPPINGS = {
 
 async function validateUserBalance(user, symbol, quantity, side) {
   try {
-    console.log(`\n💰 Validating balance for ${user.email}...`);
+    console.log(`\n   💰 Validating balance for ${user.email}...`);
     
     const endpoint = '/v2/wallet/balances';
     const headers = getAuthHeaders('GET', endpoint, '', '', user.apiKey, user.apiSecret);
@@ -240,7 +248,7 @@ async function validateUserBalance(user, symbol, quantity, side) {
     });
 
     if (!balanceRes.data.success) {
-      console.error(`❌ Failed to fetch balance for ${user.email}`);
+      console.error(`   ❌ Failed to fetch balance`);
       return { 
         valid: false, 
         error: 'Failed to fetch account balance',
@@ -254,13 +262,13 @@ async function validateUserBalance(user, symbol, quantity, side) {
     
     const availableBalance = parseFloat(wallet?.available_balance || 0);
     
-    console.log(`   Available Balance: $${availableBalance.toFixed(2)}`);
+    console.log(`   💵 Available Balance: $${availableBalance.toFixed(2)}`);
 
     if (availableBalance <= 0) {
-      console.error(`❌ ${user.email} has zero balance`);
+      console.error(`   ❌ Zero balance detected`);
       return {
         valid: false,
-        error: `Insufficient balance. Available: $${availableBalance.toFixed(2)}`,
+        error: `Insufficient balance. Available: $0.00`,
         availableBalance: 0,
         requiredMargin: 0,
         shortfall: 0
@@ -274,9 +282,9 @@ async function validateUserBalance(user, symbol, quantity, side) {
         timeout: 5000
       });
       currentPrice = parseFloat(tickerRes.data.result?.mark_price || 0);
-      console.log(`   Current Price: $${currentPrice.toFixed(2)}`);
+      console.log(`   💲 Current Price: $${currentPrice.toFixed(2)}`);
     } catch (err) {
-      console.error(`⚠️ Failed to fetch price for ${symbol}:`, err.message);
+      console.error(`   ⚠️ Failed to fetch price: ${err.message}`);
       return {
         valid: false,
         error: `Failed to fetch current price for ${symbol}`,
@@ -286,7 +294,7 @@ async function validateUserBalance(user, symbol, quantity, side) {
     }
 
     if (currentPrice <= 0) {
-      console.error(`❌ Invalid price for ${symbol}`);
+      console.error(`   ❌ Invalid price`);
       return {
         valid: false,
         error: `Invalid price for ${symbol}`,
@@ -301,14 +309,14 @@ async function validateUserBalance(user, symbol, quantity, side) {
     const estimatedFee = orderValue * 0.0005;
     const totalRequired = requiredMargin + estimatedFee;
 
-    console.log(`   Order Value: $${orderValue.toFixed(2)}`);
-    console.log(`   Required Margin: $${requiredMargin.toFixed(2)}`);
-    console.log(`   Estimated Fee: $${estimatedFee.toFixed(2)}`);
-    console.log(`   Total Required: $${totalRequired.toFixed(2)}`);
+    console.log(`   📊 Order Value: $${orderValue.toFixed(2)}`);
+    console.log(`   📊 Required Margin: $${requiredMargin.toFixed(2)}`);
+    console.log(`   📊 Estimated Fee: $${estimatedFee.toFixed(2)}`);
+    console.log(`   📊 Total Required: $${totalRequired.toFixed(2)}`);
 
     if (availableBalance < totalRequired) {
       const shortfall = totalRequired - availableBalance;
-      console.error(`❌ Insufficient balance. Shortfall: $${shortfall.toFixed(2)}`);
+      console.error(`   ❌ Insufficient balance. Shortfall: $${shortfall.toFixed(2)}`);
       return {
         valid: false,
         error: `Insufficient balance. Available: $${availableBalance.toFixed(2)}, Required: $${totalRequired.toFixed(2)}, Shortfall: $${shortfall.toFixed(2)}`,
@@ -318,7 +326,7 @@ async function validateUserBalance(user, symbol, quantity, side) {
       };
     }
 
-    console.log(`✅ Balance validation passed for ${user.email}`);
+    console.log(`   ✅ Balance validation passed`);
     return {
       valid: true,
       availableBalance,
@@ -328,7 +336,7 @@ async function validateUserBalance(user, symbol, quantity, side) {
     };
 
   } catch (error) {
-    console.error(`❌ Balance validation error for ${user.email}:`, error.message);
+    console.error(`   ❌ Balance validation error:`, error.message);
     return {
       valid: false,
       error: `Balance validation failed: ${error.message}`,
@@ -344,28 +352,42 @@ async function validateUserBalance(user, symbol, quantity, side) {
 
 async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
   try {
+    console.log(`   🔍 Fetching actual position for product ID: ${productId}`);
+    
     const endpoint = '/v2/positions';
     const queryString = `?product_id=${productId}`;
     const headers = getAuthHeaders('GET', endpoint, queryString, '', apiKey, apiSecret);
 
     const response = await axios.get(`${baseUrl}${endpoint}${queryString}`, { 
       headers, 
-      timeout: 10000 
+      timeout: 10000,
+      validateStatus: (status) => status < 500
     });
+
+    console.log(`   📥 Position API Response:`, JSON.stringify(response.data, null, 2));
 
     if (response.data.success && response.data.result) {
       const position = response.data.result;
+      const positionSize = Math.abs(parseFloat(position.size || 0));
+      const positionSide = parseFloat(position.size || 0) > 0 ? 'buy' : 'sell';
+      
+      console.log(`   📊 Position Size: ${positionSize}, Side: ${positionSide}`);
+      
       return {
-        exists: Math.abs(position.size) > 0,
-        size: Math.abs(position.size),
-        side: position.size > 0 ? 'buy' : 'sell',
+        exists: positionSize > 0,
+        size: positionSize,
+        side: positionSide,
         productId: position.product_id
       };
     }
 
+    console.log(`   ⚠️ No position found or API returned no result`);
     return { exists: false, size: 0, side: null, productId };
   } catch (error) {
-    console.error(`❌ Error fetching position:`, error.message);
+    console.error(`   ❌ Error fetching position:`, error.message);
+    if (error.response) {
+      console.error(`   Response:`, JSON.stringify(error.response.data, null, 2));
+    }
     return { exists: false, size: 0, side: null, productId };
   }
 }
@@ -376,23 +398,24 @@ async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
 
 async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🟢 Executing BUY signal for ${user.email}`);
-    console.log(`   Symbol: ${symbol}, Quantity: ${quantity}`);
+    console.log(`\n   🟢 Executing BUY signal for ${user.email}`);
+    console.log(`   📊 Symbol: ${symbol}, Quantity: ${quantity}`);
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      console.error(`❌ Symbol ${symbol} not found`);
+      console.error(`   ❌ Symbol ${symbol} not found`);
       return { success: false, error: `Symbol ${symbol} not found` };
     }
 
-    let orderSize = quantity ? parseInt(quantity) : 1;
+    let orderSize = Math.floor(parseFloat(quantity || 1));
     if (orderSize <= 0) orderSize = 1;
 
-    console.log(`   Product ID: ${product.id}, Order Size: ${orderSize}`);
+    console.log(`   📦 Product ID: ${product.id}, Order Size: ${orderSize}`);
 
+    // ✅ VALIDATE BALANCE FOR ENTRY ORDERS
     const balanceCheck = await validateUserBalance(user, symbol, orderSize, 'buy');
     if (!balanceCheck.valid) {
-      console.log(`❌ Balance validation failed for ${user.email}: ${balanceCheck.error}`);
+      console.log(`   ❌ Balance validation failed: ${balanceCheck.error}`);
       return { 
         success: false, 
         error: balanceCheck.error,
@@ -418,7 +441,7 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
     const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      console.log(`✅ BUY order placed successfully for ${user.email}. Order ID: ${result.order.id}`);
+      console.log(`   ✅ BUY order placed successfully. Order ID: ${result.order.id}`);
       
       const positionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       if (strategyPositions.has(positionKey)) {
@@ -436,33 +459,34 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
       return { success: true, orderId: result.order.id };
     }
     
-    console.error(`❌ BUY order failed for ${user.email}: ${result.error}`);
+    console.error(`   ❌ BUY order failed: ${result.error}`);
     return { success: false, error: result.error };
   } catch (error) {
-    console.error(`❌ BUY signal exception for ${user.email}:`, error.message);
+    console.error(`   ❌ BUY signal exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeSellSignal(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🔴 Executing SELL signal for ${user.email}`);
-    console.log(`   Symbol: ${symbol}, Quantity: ${quantity}`);
+    console.log(`\n   🔴 Executing SELL signal for ${user.email}`);
+    console.log(`   📊 Symbol: ${symbol}, Quantity: ${quantity}`);
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      console.error(`❌ Symbol ${symbol} not found`);
+      console.error(`   ❌ Symbol ${symbol} not found`);
       return { success: false, error: `Symbol ${symbol} not found` };
     }
 
-    let orderSize = quantity ? parseInt(quantity) : 1;
+    let orderSize = Math.floor(parseFloat(quantity || 1));
     if (orderSize <= 0) orderSize = 1;
 
-    console.log(`   Product ID: ${product.id}, Order Size: ${orderSize}`);
+    console.log(`   📦 Product ID: ${product.id}, Order Size: ${orderSize}`);
 
+    // ✅ VALIDATE BALANCE FOR ENTRY ORDERS
     const balanceCheck = await validateUserBalance(user, symbol, orderSize, 'sell');
     if (!balanceCheck.valid) {
-      console.log(`❌ Balance validation failed for ${user.email}: ${balanceCheck.error}`);
+      console.log(`   ❌ Balance validation failed: ${balanceCheck.error}`);
       return { 
         success: false, 
         error: balanceCheck.error,
@@ -488,7 +512,7 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
     const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
-      console.log(`✅ SELL order placed successfully for ${user.email}. Order ID: ${result.order.id}`);
+      console.log(`   ✅ SELL order placed successfully. Order ID: ${result.order.id}`);
       
       const positionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
       if (strategyPositions.has(positionKey)) {
@@ -506,55 +530,62 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
       return { success: true, orderId: result.order.id };
     }
     
-    console.error(`❌ SELL order failed for ${user.email}: ${result.error}`);
+    console.error(`   ❌ SELL order failed: ${result.error}`);
     return { success: false, error: result.error };
   } catch (error) {
-    console.error(`❌ SELL signal exception for ${user.email}:`, error.message);
+    console.error(`   ❌ SELL signal exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
-    console.log(`\n🔵 Executing EXIT LONG signal for ${user.email}`);
-    console.log(`   Symbol: ${symbol}, Exit Quantity: ${exitQuantity}`);
+    console.log(`\n   🔵 Executing EXIT LONG signal for ${user.email}`);
+    console.log(`   📊 Symbol: ${symbol}, Exit Quantity: ${exitQuantity}`);
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      console.error(`❌ Symbol ${symbol} not found`);
+      console.error(`   ❌ Symbol ${symbol} not found`);
       return { success: false, error: `Symbol ${symbol} not found` };
     }
 
+    console.log(`   📦 Product ID: ${product.id}`);
+
     // ✅ FIX: Get actual position from Delta Exchange API
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
-    
-    console.log(`   Actual Position:`, actualPosition);
 
-    if (!actualPosition.exists || actualPosition.side !== 'buy') {
-      console.log(`⚠️ No long position found for ${symbol}`);
-      return { success: true, message: 'No long position to exit' };
+    if (!actualPosition.exists) {
+      console.log(`   ⚠️ No position found for ${symbol}`);
+      return { success: false, error: `No open position found for ${symbol}` };
     }
+
+    if (actualPosition.side !== 'buy') {
+      console.log(`   ⚠️ Position is ${actualPosition.side}, not buy. Cannot exit long.`);
+      return { success: false, error: `Position is ${actualPosition.side}, not long. Use exitshort instead.` };
+    }
+
+    console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
     // ✅ FIX: Handle decimal quantities properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
       exitSize = actualPosition.size;
-      console.log(`   Full exit: ${exitSize} contracts`);
+      console.log(`   📊 Full exit: ${exitSize} contracts`);
     } else {
       const parsedQty = parseFloat(exitQuantity);
       exitSize = Math.floor(parsedQty);
       
       if (exitSize < 1) {
-        console.log(`⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
+        console.log(`   ⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
         exitSize = actualPosition.size;
       }
       
       if (exitSize > actualPosition.size) {
-        console.log(`⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
+        console.log(`   ⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
         exitSize = actualPosition.size;
       }
       
-      console.log(`   Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
+      console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
     }
 
     const closePayload = {
@@ -568,7 +599,7 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
     const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
-      console.log(`✅ EXIT LONG successful for ${user.email}. Order ID: ${result.order.id}`);
+      console.log(`   ✅ EXIT LONG successful. Order ID: ${result.order.id}`);
       
       // Update internal tracking
       const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
@@ -580,68 +611,75 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
         
         if (buyPosition.size <= 0) {
           strategyPositions.delete(buyPositionKey);
-          console.log(`   Position fully closed in tracking`);
+          console.log(`   📊 Position fully closed in tracking`);
         } else {
-          console.log(`   Position updated: ${buyPosition.size} remaining in tracking`);
+          console.log(`   📊 Position updated: ${buyPosition.size} remaining in tracking`);
         }
       }
       
       return { 
         success: true, 
         orderId: result.order.id,
-        message: `Exited ${exitSize} contracts, ${actualPosition.size - exitSize} remaining`
+        message: `Exited ${exitSize} contracts`
       };
     }
     
-    console.error(`❌ EXIT LONG failed for ${user.email}: ${result.error}`);
+    console.error(`   ❌ EXIT LONG failed: ${result.error}`);
     return { success: false, error: result.error };
   } catch (error) {
-    console.error(`❌ EXIT LONG exception for ${user.email}:`, error.message);
+    console.error(`   ❌ EXIT LONG exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
-    console.log(`\n🔵 Executing EXIT SHORT signal for ${user.email}`);
-    console.log(`   Symbol: ${symbol}, Exit Quantity: ${exitQuantity}`);
+    console.log(`\n   🔵 Executing EXIT SHORT signal for ${user.email}`);
+    console.log(`   📊 Symbol: ${symbol}, Exit Quantity: ${exitQuantity}`);
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      console.error(`❌ Symbol ${symbol} not found`);
+      console.error(`   ❌ Symbol ${symbol} not found`);
       return { success: false, error: `Symbol ${symbol} not found` };
     }
 
+    console.log(`   📦 Product ID: ${product.id}`);
+
     // ✅ FIX: Get actual position from Delta Exchange API
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
-    
-    console.log(`   Actual Position:`, actualPosition);
 
-    if (!actualPosition.exists || actualPosition.side !== 'sell') {
-      console.log(`⚠️ No short position found for ${symbol}`);
-      return { success: true, message: 'No short position to exit' };
+    if (!actualPosition.exists) {
+      console.log(`   ⚠️ No position found for ${symbol}`);
+      return { success: false, error: `No open position found for ${symbol}` };
     }
+
+    if (actualPosition.side !== 'sell') {
+      console.log(`   ⚠️ Position is ${actualPosition.side}, not sell. Cannot exit short.`);
+      return { success: false, error: `Position is ${actualPosition.side}, not short. Use exitlong instead.` };
+    }
+
+    console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
     // ✅ FIX: Handle decimal quantities properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
       exitSize = actualPosition.size;
-      console.log(`   Full exit: ${exitSize} contracts`);
+      console.log(`   📊 Full exit: ${exitSize} contracts`);
     } else {
       const parsedQty = parseFloat(exitQuantity);
       exitSize = Math.floor(parsedQty);
       
       if (exitSize < 1) {
-        console.log(`⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
+        console.log(`   ⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
         exitSize = actualPosition.size;
       }
       
       if (exitSize > actualPosition.size) {
-        console.log(`⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
+        console.log(`   ⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
         exitSize = actualPosition.size;
       }
       
-      console.log(`   Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
+      console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
     }
 
     const closePayload = {
@@ -655,7 +693,7 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
     const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
-      console.log(`✅ EXIT SHORT successful for ${user.email}. Order ID: ${result.order.id}`);
+      console.log(`   ✅ EXIT SHORT successful. Order ID: ${result.order.id}`);
       
       // Update internal tracking
       const sellPositionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
@@ -667,55 +705,53 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
         
         if (sellPosition.size <= 0) {
           strategyPositions.delete(sellPositionKey);
-          console.log(`   Position fully closed in tracking`);
+          console.log(`   📊 Position fully closed in tracking`);
         } else {
-          console.log(`   Position updated: ${sellPosition.size} remaining in tracking`);
+          console.log(`   📊 Position updated: ${sellPosition.size} remaining in tracking`);
         }
       }
       
       return { 
         success: true, 
         orderId: result.order.id,
-        message: `Exited ${exitSize} contracts, ${actualPosition.size - exitSize} remaining`
+        message: `Exited ${exitSize} contracts`
       };
     }
     
-    console.error(`❌ EXIT SHORT failed for ${user.email}: ${result.error}`);
+    console.error(`   ❌ EXIT SHORT failed: ${result.error}`);
     return { success: false, error: result.error };
   } catch (error) {
-    console.error(`❌ EXIT SHORT exception for ${user.email}:`, error.message);
+    console.error(`   ❌ EXIT SHORT exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeCloseLongSignal(userToken, strategyTag, symbol, user) {
-  console.log(`\n🔴 Executing CLOSE LONG (full exit) for ${user.email}`);
+  console.log(`\n   🔴 Executing CLOSE LONG (full exit) for ${user.email}`);
   return executeExitLongSignal(userToken, strategyTag, symbol, null, user);
 }
 
 async function executeCloseShortSignal(userToken, strategyTag, symbol, user) {
-  console.log(`\n🔴 Executing CLOSE SHORT (full exit) for ${user.email}`);
+  console.log(`\n   🔴 Executing CLOSE SHORT (full exit) for ${user.email}`);
   return executeExitShortSignal(userToken, strategyTag, symbol, null, user);
 }
 
 async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
   try {
-    console.log(`\n🔴 Executing EXIT ALL for ${user.email}`);
+    console.log(`\n   🔴 Executing EXIT ALL for ${user.email}`);
     
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
-      console.error(`❌ Symbol ${symbol} not found`);
+      console.error(`   ❌ Symbol ${symbol} not found`);
       return { success: false, error: `Symbol ${symbol} not found` };
     }
 
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (!actualPosition.exists) {
-      console.log(`⚠️ No position found for ${symbol}`);
-      return { success: true, message: 'No positions to exit' };
+      console.log(`   ⚠️ No position found for ${symbol}`);
+      return { success: false, error: `No open position found for ${symbol}` };
     }
-
-    const closedOrders = [];
 
     const closePayload = {
       product_id: product.id,
@@ -728,26 +764,28 @@ async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
     const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
-      console.log(`✅ Position closed for ${symbol}. Order ID: ${result.order.id}`);
-      closedOrders.push(result.order.id);
+      console.log(`   ✅ Position closed. Order ID: ${result.order.id}`);
       
       // Clear internal tracking
       const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       const sellPositionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
       strategyPositions.delete(buyPositionKey);
       strategyPositions.delete(sellPositionKey);
+      
+      return { success: true, orderId: result.order.id };
     }
-
-    return { success: true, orderId: closedOrders.join(',') };
+    
+    console.error(`   ❌ EXIT ALL failed: ${result.error}`);
+    return { success: false, error: result.error };
   } catch (error) {
-    console.error(`❌ EXIT ALL exception for ${user.email}:`, error.message);
+    console.error(`   ❌ EXIT ALL exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeReverseToShort(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🔄 Executing REVERSE TO SHORT for ${user.email}`);
+    console.log(`\n   🔄 Executing REVERSE TO SHORT for ${user.email}`);
     
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -757,21 +795,23 @@ async function executeReverseToShort(userToken, strategyTag, symbol, quantity, u
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (actualPosition.exists && actualPosition.side === 'buy') {
-      console.log(`   Closing existing long position first...`);
+      console.log(`   📊 Closing existing long position first...`);
       await executeCloseLongSignal(userToken, strategyTag, symbol, user);
+      // Wait a bit for position to close
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log(`   Opening new short position...`);
+    console.log(`   📊 Opening new short position...`);
     return await executeSellSignal(userToken, strategyTag, symbol, quantity, user, options);
   } catch (error) {
-    console.error(`❌ REVERSE TO SHORT exception:`, error.message);
+    console.error(`   ❌ REVERSE TO SHORT exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeReverseToLong(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🔄 Executing REVERSE TO LONG for ${user.email}`);
+    console.log(`\n   🔄 Executing REVERSE TO LONG for ${user.email}`);
     
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -781,21 +821,23 @@ async function executeReverseToLong(userToken, strategyTag, symbol, quantity, us
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (actualPosition.exists && actualPosition.side === 'sell') {
-      console.log(`   Closing existing short position first...`);
+      console.log(`   📊 Closing existing short position first...`);
       await executeCloseShortSignal(userToken, strategyTag, symbol, user);
+      // Wait a bit for position to close
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log(`   Opening new long position...`);
+    console.log(`   📊 Opening new long position...`);
     return await executeBuySignal(userToken, strategyTag, symbol, quantity, user, options);
   } catch (error) {
-    console.error(`❌ REVERSE TO LONG exception:`, error.message);
+    console.error(`   ❌ REVERSE TO LONG exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeReenterLong(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🔁 Executing REENTER LONG for ${user.email}`);
+    console.log(`\n   🔁 Executing REENTER LONG for ${user.email}`);
     
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -805,21 +847,23 @@ async function executeReenterLong(userToken, strategyTag, symbol, quantity, user
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (actualPosition.exists && actualPosition.side === 'buy') {
-      console.log(`   Closing existing long position first...`);
+      console.log(`   📊 Closing existing long position first...`);
       await executeCloseLongSignal(userToken, strategyTag, symbol, user);
+      // Wait a bit for position to close
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log(`   Opening new long position...`);
+    console.log(`   📊 Opening new long position...`);
     return await executeBuySignal(userToken, strategyTag, symbol, quantity, user, options);
   } catch (error) {
-    console.error(`❌ REENTER LONG exception:`, error.message);
+    console.error(`   ❌ REENTER LONG exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
 
 async function executeReenterShort(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
-    console.log(`\n🔁 Executing REENTER SHORT for ${user.email}`);
+    console.log(`\n   🔁 Executing REENTER SHORT for ${user.email}`);
     
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -829,14 +873,16 @@ async function executeReenterShort(userToken, strategyTag, symbol, quantity, use
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (actualPosition.exists && actualPosition.side === 'sell') {
-      console.log(`   Closing existing short position first...`);
+      console.log(`   📊 Closing existing short position first...`);
       await executeCloseShortSignal(userToken, strategyTag, symbol, user);
+      // Wait a bit for position to close
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
-    console.log(`   Opening new short position...`);
+    console.log(`   📊 Opening new short position...`);
     return await executeSellSignal(userToken, strategyTag, symbol, quantity, user, options);
   } catch (error) {
-    console.error(`❌ REENTER SHORT exception:`, error.message);
+    console.error(`   ❌ REENTER SHORT exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
@@ -1227,6 +1273,7 @@ app.post('/api/webhook/admin', async (req, res) => {
             headers: { 'Content-Type': 'application/json' }, timeout: 5000
           });
           currentPrice = tickerRes.data.result?.mark_price || 0;
+          console.log(`   💲 Current Price: $${currentPrice.toFixed(2)}`);
         } catch (err) {
           console.error(`   ⚠️ Failed to fetch price: ${err.message}`);
         }
@@ -1303,7 +1350,7 @@ app.post('/api/webhook/admin', async (req, res) => {
           balanceInfo: result.balanceInfo || null
         });
 
-        console.log(`   ${result.success ? '✅ SUCCESS' : '❌ FAILED'}: ${result.success ? (result.orderId || 'Completed') : result.error}`);
+        console.log(`   ${result.success ? '✅ SUCCESS' : '❌ FAILED'}: ${result.success ? (result.orderId || result.message || 'Completed') : result.error}`);
       } catch (error) {
         console.error(`   ❌ EXCEPTION: ${error.message}`);
         executionResults.push({
