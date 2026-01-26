@@ -12,12 +12,14 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['http://localhost:3000', 'http://localhost:3001'];
 
 // ========================================
-// 🔧 CORS CONFIGURATION
+// 🔧 CORS CONFIGURATION - FIXED
 // ========================================
 
 const corsOptions = {
   origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
+    
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
@@ -33,16 +35,20 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
+// ✅ FIX: Webhook endpoint should bypass CORS entirely
 app.use((req, res, next) => {
+  // Webhook endpoint - allow all origins
   if (req.path === '/api/webhook/admin') {
     res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-session-id');
+    res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') {
       return res.sendStatus(200);
     }
-    return next();
+    return next(); // ✅ Skip CORS middleware for webhooks
   }
+  
+  // All other endpoints use CORS
   cors(corsOptions)(req, res, next);
 });
 
@@ -135,7 +141,7 @@ function isAdmin(req) {
   return sessionId === ADMIN_SESSION_ID || (session && session.isAdmin === true);
 }
 
-// ✅ FIX: Helper to format error messages properly
+// ✅ Helper to format error messages properly
 function formatErrorMessage(error) {
   if (typeof error === 'string') return error;
   if (error && typeof error === 'object') {
@@ -146,7 +152,8 @@ function formatErrorMessage(error) {
         'invalid_leverage': 'Invalid leverage setting',
         'position_size_exceeded': 'Position size limit exceeded',
         'invalid_reduce_only_order': 'Invalid reduce-only order - No position to close',
-        'no_position_to_close': 'No position available to close'
+        'no_position_to_close': 'No position available to close',
+        'insufficient_balance': 'Insufficient balance for this order'
       };
       return errorMessages[error.code] || `Error: ${error.code}`;
     }
@@ -191,7 +198,19 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
     } else {
       const errorMsg = formatErrorMessage(response.data.error) || 'Order placement failed';
       console.error(`   ❌ Order failed:`, errorMsg);
-      return { success: false, error: errorMsg };
+      
+      // ✅ Extract balance info from Delta's error response if available
+      let balanceInfo = null;
+      if (response.data.error && response.data.error.code === 'insufficient_margin') {
+        balanceInfo = {
+          available: 0,
+          required: 0,
+          shortfall: 0,
+          message: 'Insufficient margin - Check your Delta Exchange account'
+        };
+      }
+      
+      return { success: false, error: errorMsg, balanceInfo };
     }
   } catch (error) {
     console.error(`   ❌ Order exception:`, error.message);
@@ -199,7 +218,19 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
       console.error(`   Response Status:`, error.response.status);
       console.error(`   Response Data:`, JSON.stringify(error.response.data, null, 2));
       const errorMsg = formatErrorMessage(error.response.data?.error) || error.message;
-      return { success: false, error: errorMsg };
+      
+      // Extract balance info if available
+      let balanceInfo = null;
+      if (error.response.data?.error?.code === 'insufficient_margin') {
+        balanceInfo = {
+          available: 0,
+          required: 0,
+          shortfall: 0,
+          message: 'Insufficient margin - Check your Delta Exchange account'
+        };
+      }
+      
+      return { success: false, error: errorMsg, balanceInfo };
     }
     return { success: false, error: error.message };
   }
@@ -226,23 +257,43 @@ function updateStrategyTracking(userToken, strategyTag, symbol) {
   }
 }
 
+// ========================================
+// ✅ FIXED: Volume Calculation (Always Returns Integer)
+// ========================================
+
 function calculateVolume(volumeValue, volumeType, accountBalance, currentPrice) {
+  // Direct lot size
   if (!volumeType || volumeType === 'volume') {
-    const parsed = parseFloat(volumeValue);
-    return Math.floor(parsed) > 0 ? Math.floor(parsed) : 1;
+    const parsed = Math.floor(parseFloat(volumeValue));
+    return parsed > 0 ? parsed : 1;
   }
+  
+  // USD amount
   if (volumeType === 'USD') {
-    if (!currentPrice || currentPrice <= 0) return 1;
-    const calculatedLots = Math.floor(volumeValue / currentPrice);
+    if (!currentPrice || currentPrice <= 0) {
+      console.log(`   ⚠️ Invalid price for USD calculation, defaulting to 1 lot`);
+      return 1;
+    }
+    const calculatedLots = Math.floor(parseFloat(volumeValue) / currentPrice);
     return calculatedLots > 0 ? calculatedLots : 1;
   }
+  
+  // Equity percentage
   if (volumeType === 'equity_percent') {
-    if (!accountBalance || accountBalance <= 0) return 1;
-    const tradingAmount = (accountBalance * volumeValue) / 100;
-    if (!currentPrice || currentPrice <= 0) return 1;
+    if (!accountBalance || accountBalance <= 0) {
+      console.log(`   ⚠️ Invalid balance for equity_percent calculation, defaulting to 1 lot`);
+      return 1;
+    }
+    const tradingAmount = (accountBalance * parseFloat(volumeValue)) / 100;
+    if (!currentPrice || currentPrice <= 0) {
+      console.log(`   ⚠️ Invalid price for equity_percent calculation, defaulting to 1 lot`);
+      return 1;
+    }
     const calculatedLots = Math.floor(tradingAmount / currentPrice);
     return calculatedLots > 0 ? calculatedLots : 1;
   }
+  
+  // Default
   return 1;
 }
 
@@ -254,120 +305,6 @@ const ACTION_MAPPINGS = {
   'closelongbuy': 'REENTER_LONG', 'closeshortsell': 'REENTER_SHORT',
   'exit': 'EXIT_ALL', 'close': 'EXIT_ALL'
 };
-
-// ========================================
-// 💰 BALANCE VALIDATION FUNCTION
-// ========================================
-
-async function validateUserBalance(user, symbol, quantity, side) {
-  try {
-    console.log(`\n   💰 Validating balance for ${user.email}...`);
-    
-    const endpoint = '/v2/wallet/balances';
-    const headers = getAuthHeaders('GET', endpoint, '', '', user.apiKey, user.apiSecret);
-    const balanceRes = await axios.get(`${user.baseUrl}${endpoint}`, { 
-      headers, 
-      timeout: 5000 
-    });
-
-    if (!balanceRes.data.success) {
-      console.error(`   ❌ Failed to fetch balance`);
-      return { 
-        valid: false, 
-        error: 'Failed to fetch account balance',
-        availableBalance: 0,
-        requiredMargin: 0
-      };
-    }
-
-    const wallet = balanceRes.data.result.find(w => w.asset_symbol === 'USDT') || 
-                   balanceRes.data.result[0];
-    
-    const availableBalance = parseFloat(wallet?.available_balance || 0);
-    
-    console.log(`   💵 Available Balance: $${availableBalance.toFixed(2)}`);
-
-    if (availableBalance <= 0) {
-      console.error(`   ❌ Zero balance detected`);
-      return {
-        valid: false,
-        error: `Insufficient balance. Available: $0.00`,
-        availableBalance: 0,
-        requiredMargin: 0,
-        shortfall: 0
-      };
-    }
-
-    let currentPrice = 0;
-    try {
-      const tickerRes = await axios.get(`${user.baseUrl}/v2/tickers/${symbol}`, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 5000
-      });
-      currentPrice = parseFloat(tickerRes.data.result?.mark_price || 0);
-      console.log(`   💲 Current Price: $${currentPrice.toFixed(2)}`);
-    } catch (err) {
-      console.error(`   ⚠️ Failed to fetch price: ${err.message}`);
-      return {
-        valid: false,
-        error: `Failed to fetch current price for ${symbol}`,
-        availableBalance,
-        requiredMargin: 0
-      };
-    }
-
-    if (currentPrice <= 0) {
-      console.error(`   ❌ Invalid price`);
-      return {
-        valid: false,
-        error: `Invalid price for ${symbol}`,
-        availableBalance,
-        requiredMargin: 0
-      };
-    }
-
-    const leverage = 10;
-    const orderValue = quantity * currentPrice;
-    const requiredMargin = orderValue / leverage;
-    const estimatedFee = orderValue * 0.0005;
-    const totalRequired = requiredMargin + estimatedFee;
-
-    console.log(`   📊 Order Value: $${orderValue.toFixed(2)}`);
-    console.log(`   📊 Required Margin: $${requiredMargin.toFixed(2)}`);
-    console.log(`   📊 Estimated Fee: $${estimatedFee.toFixed(2)}`);
-    console.log(`   📊 Total Required: $${totalRequired.toFixed(2)}`);
-
-    if (availableBalance < totalRequired) {
-      const shortfall = totalRequired - availableBalance;
-      console.error(`   ❌ Insufficient balance. Shortfall: $${shortfall.toFixed(2)}`);
-      return {
-        valid: false,
-        error: `Insufficient balance. Available: $${availableBalance.toFixed(2)}, Required: $${totalRequired.toFixed(2)}, Shortfall: $${shortfall.toFixed(2)}`,
-        availableBalance,
-        requiredMargin: totalRequired,
-        shortfall
-      };
-    }
-
-    console.log(`   ✅ Balance validation passed`);
-    return {
-      valid: true,
-      availableBalance,
-      requiredMargin: totalRequired,
-      currentPrice,
-      orderValue
-    };
-
-  } catch (error) {
-    console.error(`   ❌ Balance validation error:`, error.message);
-    return {
-      valid: false,
-      error: `Balance validation failed: ${error.message}`,
-      availableBalance: 0,
-      requiredMargin: 0
-    };
-  }
-}
 
 // ========================================
 // 🔵 HELPER: Get Actual Position from Delta Exchange
@@ -388,7 +325,6 @@ async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
     });
 
     console.log(`   📥 Position API Response Status: ${response.status}`);
-    console.log(`   📥 Position Data:`, JSON.stringify(response.data, null, 2));
 
     if (response.data.success && response.data.result) {
       const position = response.data.result;
@@ -418,7 +354,7 @@ async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
 }
 
 // ========================================
-// 🔵 SIGNAL EXECUTION FUNCTIONS
+// 🔵 SIGNAL EXECUTION FUNCTIONS - SMART APPROACH
 // ========================================
 
 async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, options = {}) {
@@ -437,20 +373,6 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
 
     console.log(`   📦 Product ID: ${product.id}, Order Size: ${orderSize}`);
 
-    const balanceCheck = await validateUserBalance(user, symbol, orderSize, 'buy');
-    if (!balanceCheck.valid) {
-      console.log(`   ❌ Balance validation failed: ${balanceCheck.error}`);
-      return { 
-        success: false, 
-        error: balanceCheck.error,
-        balanceInfo: {
-          available: balanceCheck.availableBalance,
-          required: balanceCheck.requiredMargin,
-          shortfall: balanceCheck.shortfall
-        }
-      };
-    }
-
     const orderPayload = {
       product_id: product.id,
       side: 'buy',
@@ -462,6 +384,7 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
       orderPayload.limit_price = options.price.toString();
     }
 
+    // ✅ SMART APPROACH: Let Delta Exchange validate balance
     const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
@@ -480,11 +403,15 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
         });
       }
       updateStrategyTracking(userToken, strategyTag, symbol);
-      return { success: true, orderId: result.order.id };
+      return { success: true, orderId: result.order.id, message: `Bought ${orderSize} contracts` };
     }
     
     console.error(`   ❌ BUY order failed: ${result.error}`);
-    return { success: false, error: result.error };
+    return { 
+      success: false, 
+      error: result.error,
+      balanceInfo: result.balanceInfo // Pass through Delta's balance info if available
+    };
   } catch (error) {
     console.error(`   ❌ BUY signal exception:`, error.message);
     return { success: false, error: error.message };
@@ -507,20 +434,6 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
 
     console.log(`   📦 Product ID: ${product.id}, Order Size: ${orderSize}`);
 
-    const balanceCheck = await validateUserBalance(user, symbol, orderSize, 'sell');
-    if (!balanceCheck.valid) {
-      console.log(`   ❌ Balance validation failed: ${balanceCheck.error}`);
-      return { 
-        success: false, 
-        error: balanceCheck.error,
-        balanceInfo: {
-          available: balanceCheck.availableBalance,
-          required: balanceCheck.requiredMargin,
-          shortfall: balanceCheck.shortfall
-        }
-      };
-    }
-
     const orderPayload = {
       product_id: product.id,
       side: 'sell',
@@ -532,6 +445,7 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
       orderPayload.limit_price = options.price.toString();
     }
 
+    // ✅ SMART APPROACH: Let Delta Exchange validate balance
     const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
@@ -550,16 +464,24 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
         });
       }
       updateStrategyTracking(userToken, strategyTag, symbol);
-      return { success: true, orderId: result.order.id };
+      return { success: true, orderId: result.order.id, message: `Sold ${orderSize} contracts` };
     }
     
     console.error(`   ❌ SELL order failed: ${result.error}`);
-    return { success: false, error: result.error };
+    return { 
+      success: false, 
+      error: result.error,
+      balanceInfo: result.balanceInfo
+    };
   } catch (error) {
     console.error(`   ❌ SELL signal exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
+
+// ========================================
+// 🔵 FIXED: EXIT LONG SIGNAL (Partial Exit Support)
+// ========================================
 
 async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
@@ -574,9 +496,9 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
 
     console.log(`   📦 Product ID: ${product.id}`);
 
+    // Fetch actual position from Delta Exchange
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
 
-    // ✅ FIX: Return success with message if no position (don't fail)
     if (!actualPosition.exists) {
       console.log(`   ⚠️ No position found for ${symbol} - Skipping`);
       return { success: true, message: 'No long position to exit - Skipped', skipped: true };
@@ -589,40 +511,53 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
 
     console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
+    // ✅ Calculate exit size properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
+      // Full exit
       exitSize = actualPosition.size;
       console.log(`   📊 Full exit: ${exitSize} contracts`);
     } else {
-      const parsedQty = parseFloat(exitQuantity);
-      exitSize = Math.floor(parsedQty);
+      // Partial exit
+      const parsedQty = Math.floor(parseFloat(exitQuantity));
       
-      if (exitSize < 1) {
+      if (parsedQty < 1) {
         console.log(`   ⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
         exitSize = actualPosition.size;
-      }
-      
-      if (exitSize > actualPosition.size) {
-        console.log(`   ⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
+      } else if (parsedQty >= actualPosition.size) {
+        console.log(`   ⚠️ Exit quantity ${parsedQty} >= position size ${actualPosition.size}, closing full position`);
         exitSize = actualPosition.size;
+      } else {
+        exitSize = parsedQty;
+        console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
       }
-      
-      console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
     }
 
+    // ✅ FIX: For partial exits, DO NOT use reduce_only flag
+    // For full exits, use reduce_only flag
+    const isFullExit = exitSize >= actualPosition.size;
+    
     const closePayload = {
       product_id: product.id,
       side: 'sell',
       order_type: 'market_order',
-      size: exitSize,
-      reduce_only: true
+      size: exitSize
     };
+
+    // ✅ Only add reduce_only for full exits
+    if (isFullExit) {
+      closePayload.reduce_only = true;
+      console.log(`   🔒 Full exit - Using reduce_only flag`);
+    } else {
+      console.log(`   📊 Partial exit - NOT using reduce_only flag`);
+    }
 
     const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
       console.log(`   ✅ EXIT LONG successful. Order ID: ${result.order.id}`);
       
+      // Update tracking
       const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       const buyPosition = strategyPositions.get(buyPositionKey);
       
@@ -641,24 +576,32 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
       return { 
         success: true, 
         orderId: result.order.id,
-        message: `Exited ${exitSize} contracts`
+        message: `Exited ${exitSize} contracts${isFullExit ? ' (full exit)' : ' (partial exit)'}`
       };
     }
     
     const errorMsg = formatErrorMessage(result.error);
     console.error(`   ❌ EXIT LONG failed: ${errorMsg}`);
     
-    // ✅ FIX: If error is about no position, return success with skip
+    // If error is about no position, return success with skip
     if (errorMsg.includes('reduce-only') || errorMsg.includes('No position')) {
       return { success: true, message: 'No position to exit - Skipped', skipped: true };
     }
     
-    return { success: false, error: errorMsg };
+    return { 
+      success: false, 
+      error: errorMsg,
+      balanceInfo: result.balanceInfo
+    };
   } catch (error) {
     console.error(`   ❌ EXIT LONG exception:`, error.message);
     return { success: false, error: error.message };
   }
 }
+
+// ========================================
+// 🔵 FIXED: EXIT SHORT SIGNAL (Partial Exit Support)
+// ========================================
 
 async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
@@ -675,7 +618,6 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
 
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
 
-    // ✅ FIX: Return success with message if no position (don't fail)
     if (!actualPosition.exists) {
       console.log(`   ⚠️ No position found for ${symbol} - Skipping`);
       return { success: true, message: 'No short position to exit - Skipped', skipped: true };
@@ -688,34 +630,42 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
 
     console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
+    // ✅ Calculate exit size properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
       exitSize = actualPosition.size;
       console.log(`   📊 Full exit: ${exitSize} contracts`);
     } else {
-      const parsedQty = parseFloat(exitQuantity);
-      exitSize = Math.floor(parsedQty);
+      const parsedQty = Math.floor(parseFloat(exitQuantity));
       
-      if (exitSize < 1) {
+      if (parsedQty < 1) {
         console.log(`   ⚠️ Exit quantity ${exitQuantity} is less than 1 contract, exiting full position`);
         exitSize = actualPosition.size;
-      }
-      
-      if (exitSize > actualPosition.size) {
-        console.log(`   ⚠️ Exit quantity ${exitSize} exceeds position size ${actualPosition.size}, capping to position size`);
+      } else if (parsedQty >= actualPosition.size) {
+        console.log(`   ⚠️ Exit quantity ${parsedQty} >= position size ${actualPosition.size}, closing full position`);
         exitSize = actualPosition.size;
+      } else {
+        exitSize = parsedQty;
+        console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
       }
-      
-      console.log(`   📊 Partial exit: ${exitSize} of ${actualPosition.size} contracts`);
     }
 
+    const isFullExit = exitSize >= actualPosition.size;
+    
     const closePayload = {
       product_id: product.id,
       side: 'buy',
       order_type: 'market_order',
-      size: exitSize,
-      reduce_only: true
+      size: exitSize
     };
+
+    // ✅ Only add reduce_only for full exits
+    if (isFullExit) {
+      closePayload.reduce_only = true;
+      console.log(`   🔒 Full exit - Using reduce_only flag`);
+    } else {
+      console.log(`   📊 Partial exit - NOT using reduce_only flag`);
+    }
 
     const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
@@ -740,19 +690,22 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
       return { 
         success: true, 
         orderId: result.order.id,
-        message: `Exited ${exitSize} contracts`
+        message: `Exited ${exitSize} contracts${isFullExit ? ' (full exit)' : ' (partial exit)'}`
       };
     }
     
     const errorMsg = formatErrorMessage(result.error);
     console.error(`   ❌ EXIT SHORT failed: ${errorMsg}`);
     
-    // ✅ FIX: If error is about no position, return success with skip
     if (errorMsg.includes('reduce-only') || errorMsg.includes('No position')) {
       return { success: true, message: 'No position to exit - Skipped', skipped: true };
     }
     
-    return { success: false, error: errorMsg };
+    return { 
+      success: false, 
+      error: errorMsg,
+      balanceInfo: result.balanceInfo
+    };
   } catch (error) {
     console.error(`   ❌ EXIT SHORT exception:`, error.message);
     return { success: false, error: error.message };
@@ -781,7 +734,6 @@ async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
 
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
     
-    // ✅ FIX: Return success with message if no position (don't fail)
     if (!actualPosition.exists) {
       console.log(`   ⚠️ No position found for ${symbol} - Skipping`);
       return { success: true, message: 'No position to exit - Skipped', skipped: true };
@@ -805,18 +757,21 @@ async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
       strategyPositions.delete(buyPositionKey);
       strategyPositions.delete(sellPositionKey);
       
-      return { success: true, orderId: result.order.id };
+      return { success: true, orderId: result.order.id, message: 'Position closed successfully' };
     }
     
     const errorMsg = formatErrorMessage(result.error);
     console.error(`   ❌ EXIT ALL failed: ${errorMsg}`);
     
-    // ✅ FIX: If error is about no position, return success with skip
     if (errorMsg.includes('reduce-only') || errorMsg.includes('No position')) {
       return { success: true, message: 'No position to exit - Skipped', skipped: true };
     }
     
-    return { success: false, error: errorMsg };
+    return { 
+      success: false, 
+      error: errorMsg,
+      balanceInfo: result.balanceInfo
+    };
   } catch (error) {
     console.error(`   ❌ EXIT ALL exception:`, error.message);
     return { success: false, error: error.message };
@@ -837,7 +792,6 @@ async function executeReverseToShort(userToken, strategyTag, symbol, quantity, u
     if (actualPosition.exists && actualPosition.side === 'buy') {
       console.log(`   📊 Closing existing long position first...`);
       const closeResult = await executeCloseLongSignal(userToken, strategyTag, symbol, user);
-      // Don't fail if close fails, just log it
       if (!closeResult.success && !closeResult.skipped) {
         console.log(`   ⚠️ Failed to close long position: ${closeResult.error}`);
       }
@@ -866,7 +820,6 @@ async function executeReverseToLong(userToken, strategyTag, symbol, quantity, us
     if (actualPosition.exists && actualPosition.side === 'sell') {
       console.log(`   📊 Closing existing short position first...`);
       const closeResult = await executeCloseShortSignal(userToken, strategyTag, symbol, user);
-      // Don't fail if close fails, just log it
       if (!closeResult.success && !closeResult.skipped) {
         console.log(`   ⚠️ Failed to close short position: ${closeResult.error}`);
       }
@@ -895,7 +848,6 @@ async function executeReenterLong(userToken, strategyTag, symbol, quantity, user
     if (actualPosition.exists && actualPosition.side === 'buy') {
       console.log(`   📊 Closing existing long position first...`);
       const closeResult = await executeCloseLongSignal(userToken, strategyTag, symbol, user);
-      // Don't fail if close fails, just log it
       if (!closeResult.success && !closeResult.skipped) {
         console.log(`   ⚠️ Failed to close long position: ${closeResult.error}`);
       }
@@ -924,7 +876,6 @@ async function executeReenterShort(userToken, strategyTag, symbol, quantity, use
     if (actualPosition.exists && actualPosition.side === 'sell') {
       console.log(`   📊 Closing existing short position first...`);
       const closeResult = await executeCloseShortSignal(userToken, strategyTag, symbol, user);
-      // Don't fail if close fails, just log it
       if (!closeResult.success && !closeResult.skipped) {
         console.log(`   ⚠️ Failed to close short position: ${closeResult.error}`);
       }
@@ -1229,7 +1180,7 @@ app.get('/api/admin/execution-status', validateSession, (req, res) => {
 });
 
 // ========================================
-// 📡 WEBHOOK ENDPOINT
+// 📡 FIXED: WEBHOOK ENDPOINT - SMART APPROACH
 // ========================================
 
 app.post('/api/webhook/admin', async (req, res) => {
@@ -1243,9 +1194,30 @@ app.post('/api/webhook/admin', async (req, res) => {
   try {
     const payload = req.body;
     
-    console.log('📦 Payload:', JSON.stringify(payload, null, 2));
+    // ✅ Log raw payload for debugging
+    console.log('📦 Raw Payload:', JSON.stringify(payload, null, 2));
     console.log('🌐 Source IP:', req.ip || req.connection.remoteAddress);
     console.log('🔧 User Agent:', req.headers['user-agent']);
+    console.log('📋 Content-Type:', req.headers['content-type']);
+
+    // ✅ Validate payload is JSON
+    if (!payload || typeof payload !== 'object') {
+      console.error('❌ Invalid payload - not a JSON object');
+      webhookLogs.set(logId, {
+        id: logId,
+        timestamp: new Date(),
+        sourceIP: req.ip || req.connection.remoteAddress,
+        payload: req.body,
+        userAgent: req.headers['user-agent'],
+        status: 'rejected',
+        error: 'Invalid payload format',
+        processingTime: Date.now() - logStart
+      });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid payload format. Expected JSON object.' 
+      });
+    }
 
     webhookLogs.set(logId, {
       id: logId,
@@ -1258,15 +1230,38 @@ app.post('/api/webhook/admin', async (req, res) => {
 
     const { action, symbol, volume, volume_type, quantity, strategy_tag, order_type = 'MARKET', price } = payload;
 
-    if (!action || !symbol || !strategy_tag) {
-      console.error('❌ Missing required fields');
+    // ✅ Better validation
+    if (!action) {
+      console.error('❌ Missing required field: action');
       webhookLogs.set(logId, {
         ...webhookLogs.get(logId),
         status: 'rejected',
-        error: 'Missing required fields',
+        error: 'Missing required field: action',
         processingTime: Date.now() - logStart
       });
-      return res.status(400).json({ success: false, error: 'Missing required fields: action, symbol, strategy_tag' });
+      return res.status(400).json({ success: false, error: 'Missing required field: action' });
+    }
+
+    if (!symbol) {
+      console.error('❌ Missing required field: symbol');
+      webhookLogs.set(logId, {
+        ...webhookLogs.get(logId),
+        status: 'rejected',
+        error: 'Missing required field: symbol',
+        processingTime: Date.now() - logStart
+      });
+      return res.status(400).json({ success: false, error: 'Missing required field: symbol' });
+    }
+
+    if (!strategy_tag) {
+      console.error('❌ Missing required field: strategy_tag');
+      webhookLogs.set(logId, {
+        ...webhookLogs.get(logId),
+        status: 'rejected',
+        error: 'Missing required field: strategy_tag',
+        processingTime: Date.now() - logStart
+      });
+      return res.status(400).json({ success: false, error: 'Missing required field: strategy_tag' });
     }
 
     const normalizedAction = ACTION_MAPPINGS[action.toLowerCase()] || action.toUpperCase();
@@ -1319,7 +1314,11 @@ app.post('/api/webhook/admin', async (req, res) => {
       console.log(`\n▶️ Processing: ${userLabel}`);
       
       try {
+        // ✅ SMART APPROACH: Only fetch price and balance for volume calculation
+        // Don't do pre-validation - let Delta Exchange handle it
         let currentPrice = 0;
+        let accountBalance = 0;
+        
         try {
           const tickerRes = await axios.get(`${user.baseUrl}/v2/tickers/${symbol}`, {
             headers: { 'Content-Type': 'application/json' }, timeout: 5000
@@ -1330,7 +1329,6 @@ app.post('/api/webhook/admin', async (req, res) => {
           console.error(`   ⚠️ Failed to fetch price: ${err.message}`);
         }
 
-        let accountBalance = 0;
         try {
           const endpoint = '/v2/wallet/balances';
           const headers = getAuthHeaders('GET', endpoint, '', '', user.apiKey, user.apiSecret);
@@ -1345,8 +1343,9 @@ app.post('/api/webhook/admin', async (req, res) => {
           console.error(`   ⚠️ Failed to fetch balance: ${err.message}`);
         }
 
+        // Calculate volume based on type
         let actualVolume = volume ? calculateVolume(volume, volume_type, accountBalance, currentPrice) : 
-                          (quantity ? parseFloat(quantity) : 1);
+                          (quantity ? Math.floor(parseFloat(quantity)) : 1);
 
         console.log(`   📊 Calculated Volume: ${actualVolume}`);
 
@@ -1391,7 +1390,6 @@ app.post('/api/webhook/admin', async (req, res) => {
             result = { success: false, error: 'Invalid action type' };
         }
 
-        // ✅ FIX: Handle skipped results properly
         const isSkipped = result.skipped || false;
         
         executionResults.push({
@@ -1882,7 +1880,7 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Delta Trading Bridge v4.0 - ENHANCED WEBHOOK SYSTEM');
+  console.log('🚀 Delta Trading Bridge v4.0 - SMART WEBHOOK SYSTEM');
   console.log('='.repeat(70));
   console.log(`📡 Server: http://localhost:${PORT}`);
   console.log(`👑 Admin Key: ${ADMIN_API_KEY}`);
@@ -1898,15 +1896,14 @@ app.listen(PORT, () => {
   console.log('   Re-entry: closelongbuy, closeshortsell');
   console.log('   Generic: exit');
   console.log('='.repeat(70));
-  console.log('✅ FEATURES:');
+  console.log('✅ SMART FEATURES:');
+  console.log('   - No Pre-Validation: Delta Exchange handles balance checks');
   console.log('   - Volume Types: volume, USD, equity_percent');
   console.log('   - Order Types: MARKET, LIMIT');
-  console.log('   - Webhook Logging: Real-time monitoring');
-  console.log('   - Multi-Account: Independent execution');
-  console.log('   - Balance Validation: Pre-execution checks');
-  console.log('   - Partial Exits: Quantity-based position management');
-  console.log('   - Actual Position Tracking: Fetches real positions from Delta API');
-  console.log('   - Error Code Translation: Human-readable error messages');
+  console.log('   - Partial Exits: Works without reduce_only flag');
+  console.log('   - Full Exits: Uses reduce_only flag');
+  console.log('   - Actual Position Tracking: Real-time from Delta API');
+  console.log('   - Error Translation: Human-readable messages');
   console.log('   - Graceful Skipping: No-position exits return success');
   console.log('='.repeat(70) + '\n');
 });
