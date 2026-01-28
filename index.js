@@ -1,4 +1,6 @@
-// <!-- codeables\index.js -->
+// UPDATED BACKEND CODE WITH ALL ADVANCED FEATURES
+// File: codeables/index.js
+
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -12,20 +14,14 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   : ['http://localhost:3000', 'http://localhost:3001'];
 
 // ========================================
-// 🔧 CORS CONFIGURATION - FIXED
+// 🔧 CORS CONFIGURATION
 // ========================================
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
-      return callback(null, true);
-    }
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) return callback(null, true);
     console.error('❌ Blocked by CORS:', origin);
     return callback(new Error('Not allowed by CORS'));
   },
@@ -35,20 +31,14 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
-// ✅ FIX: Webhook endpoint should bypass CORS entirely
 app.use((req, res, next) => {
-  // Webhook endpoint - allow all origins
   if (req.path === '/api/webhook/admin') {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
-    }
-    return next(); // ✅ Skip CORS middleware for webhooks
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    return next();
   }
-  
-  // All other endpoints use CORS
   cors(corsOptions)(req, res, next);
 });
 
@@ -100,7 +90,7 @@ function getAuthHeaders(method, endpoint, queryString = '', payload = '', apiKey
     'timestamp': timestamp,
     'signature': signature,
     'Content-Type': 'application/json',
-    'User-Agent': 'delta-trading-bridge-v4'
+    'User-Agent': 'delta-trading-bridge-v5'
   };
 }
 
@@ -141,7 +131,6 @@ function isAdmin(req) {
   return sessionId === ADMIN_SESSION_ID || (session && session.isAdmin === true);
 }
 
-// ✅ Helper to format error messages properly
 function formatErrorMessage(error) {
   if (typeof error === 'string') return error;
   if (error && typeof error === 'object') {
@@ -176,17 +165,21 @@ async function getProductBySymbol(symbol, baseUrl) {
   }
 }
 
-async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
+// ========================================
+// ✅ NEW: ADVANCED ORDER PLACEMENT WITH ALL FEATURES
+// ========================================
+
+async function placeAdvancedOrder(orderPayload, apiKey, apiSecret, baseUrl) {
   try {
     const payload = JSON.stringify(orderPayload);
     const endpoint = '/v2/orders';
     const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
 
-    console.log(`   📤 Placing order:`, JSON.stringify(orderPayload, null, 2));
+    console.log(`   📤 Placing advanced order:`, JSON.stringify(orderPayload, null, 2));
 
     const response = await axios.post(`${baseUrl}${endpoint}`, orderPayload, {
       headers,
-      timeout: 10000,
+      timeout: 15000,
       validateStatus: (status) => status < 500
     });
 
@@ -199,7 +192,6 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
       const errorMsg = formatErrorMessage(response.data.error) || 'Order placement failed';
       console.error(`   ❌ Order failed:`, errorMsg);
       
-      // ✅ Extract balance info from Delta's error response if available
       let balanceInfo = null;
       if (response.data.error && response.data.error.code === 'insufficient_margin') {
         balanceInfo = {
@@ -219,7 +211,6 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
       console.error(`   Response Data:`, JSON.stringify(error.response.data, null, 2));
       const errorMsg = formatErrorMessage(error.response.data?.error) || error.message;
       
-      // Extract balance info if available
       let balanceInfo = null;
       if (error.response.data?.error?.code === 'insufficient_margin') {
         balanceInfo = {
@@ -234,6 +225,226 @@ async function placeOrder(orderPayload, apiKey, apiSecret, baseUrl) {
     }
     return { success: false, error: error.message };
   }
+}
+
+// ========================================
+// ✅ NEW: BRACKET ORDER (SL/TP) PLACEMENT
+// ========================================
+
+async function placeBracketOrder(productId, stopLossConfig, takeProfitConfig, apiKey, apiSecret, baseUrl) {
+  try {
+    const bracketPayload = {
+      product_id: productId
+    };
+
+    // Stop Loss configuration
+    if (stopLossConfig) {
+      bracketPayload.stop_loss_order = {
+        order_type: stopLossConfig.order_type || 'market_order'
+      };
+      
+      if (stopLossConfig.stop_price) {
+        bracketPayload.stop_loss_order.stop_price = stopLossConfig.stop_price.toString();
+      }
+      
+      if (stopLossConfig.trail_amount) {
+        bracketPayload.stop_loss_order.trail_amount = stopLossConfig.trail_amount.toString();
+      }
+      
+      if (stopLossConfig.order_type === 'limit_order' && stopLossConfig.limit_price) {
+        bracketPayload.stop_loss_order.limit_price = stopLossConfig.limit_price.toString();
+      }
+    }
+
+    // Take Profit configuration
+    if (takeProfitConfig) {
+      bracketPayload.take_profit_order = {
+        order_type: takeProfitConfig.order_type || 'market_order'
+      };
+      
+      if (takeProfitConfig.stop_price) {
+        bracketPayload.take_profit_order.stop_price = takeProfitConfig.stop_price.toString();
+      }
+      
+      if (takeProfitConfig.order_type === 'limit_order' && takeProfitConfig.limit_price) {
+        bracketPayload.take_profit_order.limit_price = takeProfitConfig.limit_price.toString();
+      }
+    }
+
+    // Trigger method
+    if (stopLossConfig?.trigger_method || takeProfitConfig?.trigger_method) {
+      bracketPayload.bracket_stop_trigger_method = stopLossConfig?.trigger_method || takeProfitConfig?.trigger_method || 'mark_price';
+    }
+
+    const payload = JSON.stringify(bracketPayload);
+    const endpoint = '/v2/orders/bracket';
+    const headers = getAuthHeaders('POST', endpoint, '', payload, apiKey, apiSecret);
+
+    console.log(`   📤 Placing bracket order (SL/TP):`, JSON.stringify(bracketPayload, null, 2));
+
+    const response = await axios.post(`${baseUrl}${endpoint}`, bracketPayload, {
+      headers,
+      timeout: 15000,
+      validateStatus: (status) => status < 500
+    });
+
+    console.log(`   📥 Bracket Response Status: ${response.status}`);
+
+    if (response.status === 200 && response.data.success) {
+      console.log(`   ✅ Bracket order (SL/TP) placed successfully`);
+      return { success: true };
+    } else {
+      const errorMsg = formatErrorMessage(response.data.error) || 'Bracket order failed';
+      console.error(`   ❌ Bracket order failed:`, errorMsg);
+      return { success: false, error: errorMsg };
+    }
+  } catch (error) {
+    console.error(`   ❌ Bracket order exception:`, error.message);
+    if (error.response) {
+      console.error(`   Response:`, JSON.stringify(error.response.data, null, 2));
+      return { success: false, error: formatErrorMessage(error.response.data?.error) || error.message };
+    }
+    return { success: false, error: error.message };
+  }
+}
+
+// ========================================
+// ✅ NEW: WAIT FOR POSITION CONFIRMATION
+// ========================================
+
+async function waitForPosition(productId, apiKey, apiSecret, baseUrl, timeoutSeconds = 5) {
+  const startTime = Date.now();
+  const timeout = timeoutSeconds * 1000;
+  
+  console.log(`   ⏳ Waiting for position confirmation (timeout: ${timeoutSeconds}s)...`);
+  
+  while (Date.now() - startTime < timeout) {
+    try {
+      const endpoint = '/v2/positions';
+      const queryString = `?product_id=${productId}`;
+      const headers = getAuthHeaders('GET', endpoint, queryString, '', apiKey, apiSecret);
+
+      const response = await axios.get(`${baseUrl}${endpoint}${queryString}`, { 
+        headers, 
+        timeout: 5000,
+        validateStatus: (status) => status < 500
+      });
+
+      if (response.data.success && response.data.result) {
+        const position = response.data.result;
+        const positionSize = Math.abs(parseFloat(position.size || 0));
+        
+        if (positionSize > 0) {
+          console.log(`   ✅ Position confirmed: ${positionSize} contracts`);
+          return {
+            success: true,
+            position: {
+              size: positionSize,
+              side: parseFloat(position.size) > 0 ? 'buy' : 'sell',
+              entry_price: parseFloat(position.entry_price || 0)
+            }
+          };
+        }
+      }
+      
+      // Wait 500ms before next check
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      console.error(`   ⚠️ Position check error:`, error.message);
+    }
+  }
+  
+  console.log(`   ⏱️ Position confirmation timeout after ${timeoutSeconds}s`);
+  return { success: false, error: 'Position confirmation timeout' };
+}
+
+// ========================================
+// ✅ NEW: CALCULATE SL/TP PRICES
+// ========================================
+
+function calculateTPSLPrices(entryPrice, side, tpslConfig) {
+  const result = {};
+  
+  if (!tpslConfig || !entryPrice) return result;
+  
+  const { stop_loss, take_profit, tpsl_mode = 'level' } = tpslConfig;
+  
+  // Calculate Stop Loss
+  if (stop_loss !== undefined && stop_loss !== null) {
+    switch (tpsl_mode) {
+      case 'level':
+        // Absolute price level
+        result.stop_loss_price = parseFloat(stop_loss);
+        break;
+        
+      case 'pips':
+        // Distance in pips (0.0001 for most pairs)
+        const pipValue = 0.0001;
+        if (side === 'buy') {
+          result.stop_loss_price = entryPrice - (parseFloat(stop_loss) * pipValue);
+        } else {
+          result.stop_loss_price = entryPrice + (parseFloat(stop_loss) * pipValue);
+        }
+        break;
+        
+      case 'points':
+        // Distance in points (1 point = 1 unit of price)
+        if (side === 'buy') {
+          result.stop_loss_price = entryPrice - parseFloat(stop_loss);
+        } else {
+          result.stop_loss_price = entryPrice + parseFloat(stop_loss);
+        }
+        break;
+        
+      case 'percent':
+        // Percentage distance
+        const slPercent = parseFloat(stop_loss) / 100;
+        if (side === 'buy') {
+          result.stop_loss_price = entryPrice * (1 - slPercent);
+        } else {
+          result.stop_loss_price = entryPrice * (1 + slPercent);
+        }
+        break;
+    }
+  }
+  
+  // Calculate Take Profit
+  if (take_profit !== undefined && take_profit !== null) {
+    switch (tpsl_mode) {
+      case 'level':
+        result.take_profit_price = parseFloat(take_profit);
+        break;
+        
+      case 'pips':
+        const pipValue = 0.0001;
+        if (side === 'buy') {
+          result.take_profit_price = entryPrice + (parseFloat(take_profit) * pipValue);
+        } else {
+          result.take_profit_price = entryPrice - (parseFloat(take_profit) * pipValue);
+        }
+        break;
+        
+      case 'points':
+        if (side === 'buy') {
+          result.take_profit_price = entryPrice + parseFloat(take_profit);
+        } else {
+          result.take_profit_price = entryPrice - parseFloat(take_profit);
+        }
+        break;
+        
+      case 'percent':
+        const tpPercent = parseFloat(take_profit) / 100;
+        if (side === 'buy') {
+          result.take_profit_price = entryPrice * (1 + tpPercent);
+        } else {
+          result.take_profit_price = entryPrice * (1 - tpPercent);
+        }
+        break;
+    }
+  }
+  
+  console.log(`   📊 Calculated SL/TP:`, result);
+  return result;
 }
 
 function updateStrategyTracking(userToken, strategyTag, symbol) {
@@ -257,18 +468,12 @@ function updateStrategyTracking(userToken, strategyTag, symbol) {
   }
 }
 
-// ========================================
-// ✅ FIXED: Volume Calculation (Always Returns Integer)
-// ========================================
-
 function calculateVolume(volumeValue, volumeType, accountBalance, currentPrice) {
-  // Direct lot size
   if (!volumeType || volumeType === 'volume') {
     const parsed = Math.floor(parseFloat(volumeValue));
     return parsed > 0 ? parsed : 1;
   }
   
-  // USD amount
   if (volumeType === 'USD') {
     if (!currentPrice || currentPrice <= 0) {
       console.log(`   ⚠️ Invalid price for USD calculation, defaulting to 1 lot`);
@@ -278,7 +483,6 @@ function calculateVolume(volumeValue, volumeType, accountBalance, currentPrice) 
     return calculatedLots > 0 ? calculatedLots : 1;
   }
   
-  // Equity percentage
   if (volumeType === 'equity_percent') {
     if (!accountBalance || accountBalance <= 0) {
       console.log(`   ⚠️ Invalid balance for equity_percent calculation, defaulting to 1 lot`);
@@ -293,7 +497,6 @@ function calculateVolume(volumeValue, volumeType, accountBalance, currentPrice) 
     return calculatedLots > 0 ? calculatedLots : 1;
   }
   
-  // Default
   return 1;
 }
 
@@ -305,10 +508,6 @@ const ACTION_MAPPINGS = {
   'closelongbuy': 'REENTER_LONG', 'closeshortsell': 'REENTER_SHORT',
   'exit': 'EXIT_ALL', 'close': 'EXIT_ALL'
 };
-
-// ========================================
-// 🔵 HELPER: Get Actual Position from Delta Exchange
-// ========================================
 
 async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
   try {
@@ -338,29 +537,31 @@ async function getActualPosition(productId, apiKey, apiSecret, baseUrl) {
         exists: positionSize > 0,
         size: positionSize,
         side: positionSide,
-        productId: position.product_id
+        productId: position.product_id,
+        entry_price: parseFloat(position.entry_price || 0)
       };
     }
 
     console.log(`   ⚠️ No position found or API returned no result`);
-    return { exists: false, size: 0, side: null, productId };
+    return { exists: false, size: 0, side: null, productId, entry_price: 0 };
   } catch (error) {
     console.error(`   ❌ Error fetching position:`, error.message);
     if (error.response) {
       console.error(`   Response:`, JSON.stringify(error.response.data, null, 2));
     }
-    return { exists: false, size: 0, side: null, productId };
+    return { exists: false, size: 0, side: null, productId, entry_price: 0 };
   }
 }
 
 // ========================================
-// 🔵 SIGNAL EXECUTION FUNCTIONS - SMART APPROACH
+// 🔵 UPDATED: BUY SIGNAL WITH ADVANCED FEATURES
 // ========================================
 
 async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
     console.log(`\n   🟢 Executing BUY signal for ${user.email}`);
     console.log(`   📊 Symbol: ${symbol}, Quantity: ${quantity}`);
+    console.log(`   ⚙️ Options:`, JSON.stringify(options, null, 2));
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -373,6 +574,7 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
 
     console.log(`   📦 Product ID: ${product.id}, Order Size: ${orderSize}`);
 
+    // Build advanced order payload
     const orderPayload = {
       product_id: product.id,
       side: 'buy',
@@ -380,15 +582,132 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
       size: orderSize
     };
 
+    // Limit price for limit orders
     if (options.order_type === 'limit_order' && options.price) {
       orderPayload.limit_price = options.price.toString();
     }
 
-    // ✅ SMART APPROACH: Let Delta Exchange validate balance
-    const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
+    // ✅ NEW: Time in force
+    if (options.time_in_force) {
+      orderPayload.time_in_force = options.time_in_force; // 'gtc' or 'ioc'
+    }
+
+    // ✅ NEW: Post only
+    if (options.post_only === true) {
+      orderPayload.post_only = 'true';
+    }
+
+    // ✅ NEW: Reduce only
+    if (options.reduce_only === true) {
+      orderPayload.reduce_only = 'true';
+    }
+
+    // ✅ NEW: Client order ID
+    if (options.client_order_id) {
+      orderPayload.client_order_id = options.client_order_id;
+    }
+
+    // ✅ NEW: Bracket order parameters (inline SL/TP)
+    if (options.stop_loss || options.take_profit) {
+      const tpslPrices = calculateTPSLPrices(
+        options.price || 0, // Will be updated after market order fills
+        'buy',
+        {
+          stop_loss: options.stop_loss,
+          take_profit: options.take_profit,
+          tpsl_mode: options.tpsl_mode || 'level'
+        }
+      );
+
+      if (tpslPrices.stop_loss_price) {
+        orderPayload.bracket_stop_loss_price = tpslPrices.stop_loss_price.toString();
+        if (options.stop_loss_limit_price) {
+          orderPayload.bracket_stop_loss_limit_price = options.stop_loss_limit_price.toString();
+        }
+      }
+
+      if (tpslPrices.take_profit_price) {
+        orderPayload.bracket_take_profit_price = tpslPrices.take_profit_price.toString();
+        if (options.take_profit_limit_price) {
+          orderPayload.bracket_take_profit_limit_price = options.take_profit_limit_price.toString();
+        }
+      }
+
+      // Trigger method
+      if (options.trigger_method) {
+        orderPayload.bracket_stop_trigger_method = options.trigger_method;
+      }
+
+      // Trailing stop
+      if (options.trail_amount) {
+        orderPayload.bracket_trail_amount = options.trail_amount.toString();
+      }
+    }
+
+    const result = await placeAdvancedOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
       console.log(`   ✅ BUY order placed successfully. Order ID: ${result.order.id}`);
+      
+      // ✅ NEW: Wait for position if requested
+      if (options.wait_for_position && options.wait_for_position > 0) {
+        const positionResult = await waitForPosition(
+          product.id,
+          user.apiKey,
+          user.apiSecret,
+          user.baseUrl,
+          options.wait_for_position
+        );
+
+        if (positionResult.success) {
+          console.log(`   ✅ Position confirmed`);
+          
+          // ✅ NEW: Place bracket order AFTER position is confirmed (for market orders)
+          if (orderPayload.order_type === 'market_order' && (options.stop_loss || options.take_profit)) {
+            const entryPrice = positionResult.position.entry_price;
+            const tpslPrices = calculateTPSLPrices(
+              entryPrice,
+              'buy',
+              {
+                stop_loss: options.stop_loss,
+                take_profit: options.take_profit,
+                tpsl_mode: options.tpsl_mode || 'level'
+              }
+            );
+
+            const stopLossConfig = tpslPrices.stop_loss_price ? {
+              order_type: 'market_order',
+              stop_price: tpslPrices.stop_loss_price,
+              trigger_method: options.trigger_method || 'mark_price'
+            } : null;
+
+            const takeProfitConfig = tpslPrices.take_profit_price ? {
+              order_type: 'market_order',
+              stop_price: tpslPrices.take_profit_price,
+              trigger_method: options.trigger_method || 'mark_price'
+            } : null;
+
+            if (stopLossConfig || takeProfitConfig) {
+              const bracketResult = await placeBracketOrder(
+                product.id,
+                stopLossConfig,
+                takeProfitConfig,
+                user.apiKey,
+                user.apiSecret,
+                user.baseUrl
+              );
+
+              if (bracketResult.success) {
+                console.log(`   ✅ SL/TP bracket order placed successfully`);
+              } else {
+                console.log(`   ⚠️ SL/TP bracket order failed: ${bracketResult.error}`);
+              }
+            }
+          }
+        } else {
+          console.log(`   ⚠️ Position not confirmed: ${positionResult.error}`);
+        }
+      }
       
       const positionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       if (strategyPositions.has(positionKey)) {
@@ -410,7 +729,7 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
     return { 
       success: false, 
       error: result.error,
-      balanceInfo: result.balanceInfo // Pass through Delta's balance info if available
+      balanceInfo: result.balanceInfo
     };
   } catch (error) {
     console.error(`   ❌ BUY signal exception:`, error.message);
@@ -418,10 +737,15 @@ async function executeBuySignal(userToken, strategyTag, symbol, quantity, user, 
   }
 }
 
+// ========================================
+// 🔵 UPDATED: SELL SIGNAL WITH ADVANCED FEATURES
+// ========================================
+
 async function executeSellSignal(userToken, strategyTag, symbol, quantity, user, options = {}) {
   try {
     console.log(`\n   🔴 Executing SELL signal for ${user.email}`);
     console.log(`   📊 Symbol: ${symbol}, Quantity: ${quantity}`);
+    console.log(`   ⚙️ Options:`, JSON.stringify(options, null, 2));
 
     const product = await getProductBySymbol(symbol, user.baseUrl);
     if (!product) {
@@ -445,11 +769,118 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
       orderPayload.limit_price = options.price.toString();
     }
 
-    // ✅ SMART APPROACH: Let Delta Exchange validate balance
-    const result = await placeOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
+    if (options.time_in_force) {
+      orderPayload.time_in_force = options.time_in_force;
+    }
+
+    if (options.post_only === true) {
+      orderPayload.post_only = 'true';
+    }
+
+    if (options.reduce_only === true) {
+      orderPayload.reduce_only = 'true';
+    }
+
+    if (options.client_order_id) {
+      orderPayload.client_order_id = options.client_order_id;
+    }
+
+    if (options.stop_loss || options.take_profit) {
+      const tpslPrices = calculateTPSLPrices(
+        options.price || 0,
+        'sell',
+        {
+          stop_loss: options.stop_loss,
+          take_profit: options.take_profit,
+          tpsl_mode: options.tpsl_mode || 'level'
+        }
+      );
+
+      if (tpslPrices.stop_loss_price) {
+        orderPayload.bracket_stop_loss_price = tpslPrices.stop_loss_price.toString();
+        if (options.stop_loss_limit_price) {
+          orderPayload.bracket_stop_loss_limit_price = options.stop_loss_limit_price.toString();
+        }
+      }
+
+      if (tpslPrices.take_profit_price) {
+        orderPayload.bracket_take_profit_price = tpslPrices.take_profit_price.toString();
+        if (options.take_profit_limit_price) {
+          orderPayload.bracket_take_profit_limit_price = options.take_profit_limit_price.toString();
+        }
+      }
+
+      if (options.trigger_method) {
+        orderPayload.bracket_stop_trigger_method = options.trigger_method;
+      }
+
+      if (options.trail_amount) {
+        orderPayload.bracket_trail_amount = options.trail_amount.toString();
+      }
+    }
+
+    const result = await placeAdvancedOrder(orderPayload, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (result.success) {
       console.log(`   ✅ SELL order placed successfully. Order ID: ${result.order.id}`);
+      
+      if (options.wait_for_position && options.wait_for_position > 0) {
+        const positionResult = await waitForPosition(
+          product.id,
+          user.apiKey,
+          user.apiSecret,
+          user.baseUrl,
+          options.wait_for_position
+        );
+
+        if (positionResult.success) {
+          console.log(`   ✅ Position confirmed`);
+          
+          if (orderPayload.order_type === 'market_order' && (options.stop_loss || options.take_profit)) {
+            const entryPrice = positionResult.position.entry_price;
+            const tpslPrices = calculateTPSLPrices(
+              entryPrice,
+              'sell',
+              {
+                stop_loss: options.stop_loss,
+                take_profit: options.take_profit,
+                tpsl_mode: options.tpsl_mode || 'level'
+              }
+            );
+
+            const stopLossConfig = tpslPrices.stop_loss_price ? {
+              order_type: 'market_order',
+              stop_price: tpslPrices.stop_loss_price,
+              trigger_method: options.trigger_method || 'mark_price'
+            } : null;
+
+            const takeProfitConfig = tpslPrices.take_profit_price ? {
+              order_type: 'market_order',
+              stop_price: tpslPrices.take_profit_price,
+              trigger_method: options.trigger_method || 'mark_price'
+            } : null;
+
+            if (stopLossConfig || takeProfitConfig) {
+              const bracketResult = await placeBracketOrder(
+                product.id,
+                stopLossConfig,
+                takeProfitConfig,
+                user.apiKey,
+                user.apiSecret,
+                user.baseUrl
+              );
+
+              if (bracketResult.success) {
+                console.log(`   ✅ SL/TP bracket order placed successfully`);
+              } else {
+                console.log(`   ⚠️ SL/TP bracket order failed: ${bracketResult.error}`);
+              }
+            }
+          }
+        } else {
+          console.log(`   ⚠️ Position not confirmed: ${positionResult.error}`);
+        }
+      }
       
       const positionKey = getPositionKey(userToken, strategyTag, symbol, 'sell');
       if (strategyPositions.has(positionKey)) {
@@ -479,9 +910,8 @@ async function executeSellSignal(userToken, strategyTag, symbol, quantity, user,
   }
 }
 
-// ========================================
-// 🔵 FIXED: EXIT LONG SIGNAL (Partial Exit Support)
-// ========================================
+// [Continue with EXIT functions - they remain the same as before]
+// I'll include the exit functions for completeness but they don't need changes
 
 async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
@@ -496,7 +926,6 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
 
     console.log(`   📦 Product ID: ${product.id}`);
 
-    // Fetch actual position from Delta Exchange
     const actualPosition = await getActualPosition(product.id, user.apiKey, user.apiSecret, user.baseUrl);
 
     if (!actualPosition.exists) {
@@ -511,14 +940,11 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
 
     console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
-    // ✅ Calculate exit size properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
-      // Full exit
       exitSize = actualPosition.size;
       console.log(`   📊 Full exit: ${exitSize} contracts`);
     } else {
-      // Partial exit
       const parsedQty = Math.floor(parseFloat(exitQuantity));
       
       if (parsedQty < 1) {
@@ -533,8 +959,6 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
       }
     }
 
-    // ✅ FIX: For partial exits, DO NOT use reduce_only flag
-    // For full exits, use reduce_only flag
     const isFullExit = exitSize >= actualPosition.size;
     
     const closePayload = {
@@ -544,7 +968,6 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
       size: exitSize
     };
 
-    // ✅ Only add reduce_only for full exits
     if (isFullExit) {
       closePayload.reduce_only = true;
       console.log(`   🔒 Full exit - Using reduce_only flag`);
@@ -552,12 +975,11 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
       console.log(`   📊 Partial exit - NOT using reduce_only flag`);
     }
 
-    const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
+    const result = await placeAdvancedOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
       console.log(`   ✅ EXIT LONG successful. Order ID: ${result.order.id}`);
       
-      // Update tracking
       const buyPositionKey = getPositionKey(userToken, strategyTag, symbol, 'buy');
       const buyPosition = strategyPositions.get(buyPositionKey);
       
@@ -583,7 +1005,6 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
     const errorMsg = formatErrorMessage(result.error);
     console.error(`   ❌ EXIT LONG failed: ${errorMsg}`);
     
-    // If error is about no position, return success with skip
     if (errorMsg.includes('reduce-only') || errorMsg.includes('No position')) {
       return { success: true, message: 'No position to exit - Skipped', skipped: true };
     }
@@ -598,10 +1019,6 @@ async function executeExitLongSignal(userToken, strategyTag, symbol, exitQuantit
     return { success: false, error: error.message };
   }
 }
-
-// ========================================
-// 🔵 FIXED: EXIT SHORT SIGNAL (Partial Exit Support)
-// ========================================
 
 async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuantity, user) {
   try {
@@ -630,7 +1047,6 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
 
     console.log(`   📊 Actual Position Size: ${actualPosition.size}`);
 
-    // ✅ Calculate exit size properly
     let exitSize;
     if (exitQuantity === null || exitQuantity === undefined) {
       exitSize = actualPosition.size;
@@ -659,7 +1075,6 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
       size: exitSize
     };
 
-    // ✅ Only add reduce_only for full exits
     if (isFullExit) {
       closePayload.reduce_only = true;
       console.log(`   🔒 Full exit - Using reduce_only flag`);
@@ -667,7 +1082,7 @@ async function executeExitShortSignal(userToken, strategyTag, symbol, exitQuanti
       console.log(`   📊 Partial exit - NOT using reduce_only flag`);
     }
 
-    const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
+    const result = await placeAdvancedOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
       console.log(`   ✅ EXIT SHORT successful. Order ID: ${result.order.id}`);
@@ -747,7 +1162,7 @@ async function executeExitAllSignal(userToken, strategyTag, symbol, user) {
       reduce_only: true
     };
 
-    const result = await placeOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
+    const result = await placeAdvancedOrder(closePayload, user.apiKey, user.apiSecret, user.baseUrl);
     
     if (result.success) {
       console.log(`   ✅ Position closed. Order ID: ${result.order.id}`);
@@ -898,17 +1313,30 @@ app.get('/api/health', (req, res) => {
   res.json({
     success: true,
     status: 'healthy',
+    version: '5.0.0',
     timestamp: new Date().toISOString(),
     activeSessions: userSessions.size,
     registeredUsers: registeredUsers.size,
     totalSignals: masterSignals.size,
     webhookLogs: webhookLogs.size,
-    adminExecutionEnabled
+    adminExecutionEnabled,
+    features: {
+      stop_loss_take_profit: true,
+      wait_for_position: true,
+      advanced_order_types: true,
+      time_in_force: true,
+      post_only: true,
+      reduce_only: true,
+      trailing_stop: true,
+      trigger_methods: true,
+      client_order_id: true,
+      bracket_orders: true
+    }
   });
 });
 
 // ========================================
-// 🔐 AUTHENTICATION
+// 🔐 AUTHENTICATION (Keep existing code)
 // ========================================
 
 app.post('/api/auth/login', async (req, res) => {
@@ -1048,7 +1476,7 @@ app.get('/api/auth/validate', validateSession, (req, res) => {
 });
 
 // ========================================
-// 👥 ADMIN - USER MANAGEMENT
+// 👥 ADMIN - USER MANAGEMENT (Keep existing)
 // ========================================
 
 app.get('/api/admin/users', validateSession, (req, res) => {
@@ -1139,7 +1567,7 @@ app.post('/api/admin/users/:userToken/toggle', validateSession, (req, res) => {
 });
 
 // ========================================
-// 👑 ADMIN EXECUTION TOGGLE
+// 👑 ADMIN EXECUTION TOGGLE (Keep existing)
 // ========================================
 
 app.post('/api/admin/toggle-execution', validateSession, (req, res) => {
@@ -1180,7 +1608,7 @@ app.get('/api/admin/execution-status', validateSession, (req, res) => {
 });
 
 // ========================================
-// 📡 FIXED: WEBHOOK ENDPOINT - SMART APPROACH
+// 📡 UPDATED: WEBHOOK ENDPOINT WITH ALL ADVANCED FEATURES
 // ========================================
 
 app.post('/api/webhook/admin', async (req, res) => {
@@ -1188,19 +1616,16 @@ app.post('/api/webhook/admin', async (req, res) => {
   const logStart = Date.now();
   
   console.log('\n' + '='.repeat(70));
-  console.log('📡 WEBHOOK SIGNAL RECEIVED');
+  console.log('📡 WEBHOOK SIGNAL RECEIVED (v5.0 - Advanced Features)');
   console.log('='.repeat(70));
   
   try {
     const payload = req.body;
     
-    // ✅ Log raw payload for debugging
     console.log('📦 Raw Payload:', JSON.stringify(payload, null, 2));
     console.log('🌐 Source IP:', req.ip || req.connection.remoteAddress);
     console.log('🔧 User Agent:', req.headers['user-agent']);
-    console.log('📋 Content-Type:', req.headers['content-type']);
 
-    // ✅ Validate payload is JSON
     if (!payload || typeof payload !== 'object') {
       console.error('❌ Invalid payload - not a JSON object');
       webhookLogs.set(logId, {
@@ -1228,9 +1653,31 @@ app.post('/api/webhook/admin', async (req, res) => {
       status: 'processing'
     });
 
-    const { action, symbol, volume, volume_type, quantity, strategy_tag, order_type = 'MARKET', price } = payload;
+    const { 
+      action, 
+      symbol, 
+      volume, 
+      volume_type, 
+      quantity, 
+      strategy_tag, 
+      order_type = 'MARKET', 
+      price,
+      // ✅ NEW: Advanced parameters
+      stop_loss,
+      take_profit,
+      tpsl_mode = 'level',
+      stop_loss_limit_price,
+      take_profit_limit_price,
+      trail_amount,
+      trigger_method = 'mark_price',
+      time_in_force,
+      post_only,
+      reduce_only,
+      client_order_id,
+      wait_for_position = 2.0
+    } = payload;
 
-    // ✅ Better validation
+    // Validation
     if (!action) {
       console.error('❌ Missing required field: action');
       webhookLogs.set(logId, {
@@ -1269,6 +1716,20 @@ app.post('/api/webhook/admin', async (req, res) => {
     console.log(`📊 Symbol: ${symbol}`);
     console.log(`🏷️ Strategy: ${strategy_tag}`);
     console.log(`📈 Volume: ${volume || quantity || 'N/A'} (Type: ${volume_type || 'volume'})`);
+    
+    // ✅ NEW: Log advanced parameters
+    if (stop_loss || take_profit) {
+      console.log(`🎯 SL/TP Mode: ${tpsl_mode}`);
+      if (stop_loss) console.log(`   🛑 Stop Loss: ${stop_loss}`);
+      if (take_profit) console.log(`   🎯 Take Profit: ${take_profit}`);
+      if (trail_amount) console.log(`   📈 Trail Amount: ${trail_amount}`);
+      if (trigger_method) console.log(`   🔔 Trigger Method: ${trigger_method}`);
+    }
+    if (time_in_force) console.log(`⏱️ Time in Force: ${time_in_force}`);
+    if (post_only) console.log(`📌 Post Only: ${post_only}`);
+    if (reduce_only) console.log(`🔒 Reduce Only: ${reduce_only}`);
+    if (client_order_id) console.log(`🆔 Client Order ID: ${client_order_id}`);
+    if (wait_for_position) console.log(`⏳ Wait for Position: ${wait_for_position}s`);
 
     const activeUsers = Array.from(registeredUsers.values()).filter(u => u.isActive);
     console.log(`\n👥 Active Users: ${activeUsers.length}`);
@@ -1314,8 +1775,6 @@ app.post('/api/webhook/admin', async (req, res) => {
       console.log(`\n▶️ Processing: ${userLabel}`);
       
       try {
-        // ✅ SMART APPROACH: Only fetch price and balance for volume calculation
-        // Don't do pre-validation - let Delta Exchange handle it
         let currentPrice = 0;
         let accountBalance = 0;
         
@@ -1343,13 +1802,28 @@ app.post('/api/webhook/admin', async (req, res) => {
           console.error(`   ⚠️ Failed to fetch balance: ${err.message}`);
         }
 
-        // Calculate volume based on type
         let actualVolume = volume ? calculateVolume(volume, volume_type, accountBalance, currentPrice) : 
                           (quantity ? Math.floor(parseFloat(quantity)) : 1);
 
         console.log(`   📊 Calculated Volume: ${actualVolume}`);
 
-        const options = { order_type: order_type === 'LIMIT' ? 'limit_order' : 'market_order', price };
+        // ✅ NEW: Build advanced options object
+        const options = { 
+          order_type: order_type === 'LIMIT' ? 'limit_order' : 'market_order', 
+          price,
+          stop_loss,
+          take_profit,
+          tpsl_mode,
+          stop_loss_limit_price,
+          take_profit_limit_price,
+          trail_amount,
+          trigger_method,
+          time_in_force,
+          post_only,
+          reduce_only,
+          client_order_id,
+          wait_for_position: parseFloat(wait_for_position || 2.0)
+        };
 
         let result;
         switch (normalizedAction) {
@@ -1446,6 +1920,9 @@ app.post('/api/webhook/admin', async (req, res) => {
       volume_type,
       strategy_tag,
       order_type,
+      stop_loss,
+      take_profit,
+      tpsl_mode,
       executionResults,
       processingTime: Date.now() - logStart
     });
@@ -1461,7 +1938,10 @@ app.post('/api/webhook/admin', async (req, res) => {
       strategy_name: strategy_tag,
       order_type,
       price,
-      description: `Webhook signal`,
+      stop_loss,
+      take_profit,
+      tpsl_mode,
+      description: `Webhook signal with advanced features`,
       created_at: new Date(),
       execution_count: executionResults.length,
       success_count: successCount,
@@ -1482,7 +1962,16 @@ app.post('/api/webhook/admin', async (req, res) => {
       skipped_count: skippedCount,
       executionResults,
       adminExecutionEnabled,
-      processingTime: Date.now() - logStart
+      processingTime: Date.now() - logStart,
+      features_used: {
+        stop_loss: !!stop_loss,
+        take_profit: !!take_profit,
+        trailing_stop: !!trail_amount,
+        time_in_force: !!time_in_force,
+        post_only: !!post_only,
+        reduce_only: !!reduce_only,
+        wait_for_position: !!wait_for_position
+      }
     });
   } catch (error) {
     console.error('\n❌ WEBHOOK ERROR:', error.message);
@@ -1500,7 +1989,7 @@ app.post('/api/webhook/admin', async (req, res) => {
 });
 
 // ========================================
-// 📡 WEBHOOK LOGS & SIGNALS
+// 📡 WEBHOOK LOGS & SIGNALS (Keep existing)
 // ========================================
 
 app.get('/api/admin/webhook-logs', validateSession, (req, res) => {
@@ -1627,7 +2116,7 @@ app.get('/api/user/signals', validateSession, (req, res) => {
 });
 
 // ========================================
-// 📜 TRADING ENDPOINTS
+// 📜 TRADING ENDPOINTS (Keep existing - they already work)
 // ========================================
 
 app.get('/api/symbols', validateSession, async (req, res) => {
@@ -1846,7 +2335,7 @@ app.get('/api/wallet', validateSession, async (req, res) => {
 });
 
 // ========================================
-// 🧹 CLEANUP
+// 🧹 CLEANUP (Keep existing)
 // ========================================
 
 setInterval(() => {
@@ -1880,7 +2369,7 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(70));
-  console.log('🚀 Delta Trading Bridge v4.0 - SMART WEBHOOK SYSTEM');
+  console.log('🚀 Delta Trading Bridge v5.0 - ADVANCED FEATURES ENABLED');
   console.log('='.repeat(70));
   console.log(`📡 Server: http://localhost:${PORT}`);
   console.log(`👑 Admin Key: ${ADMIN_API_KEY}`);
@@ -1896,14 +2385,16 @@ app.listen(PORT, () => {
   console.log('   Re-entry: closelongbuy, closeshortsell');
   console.log('   Generic: exit');
   console.log('='.repeat(70));
-  console.log('✅ SMART FEATURES:');
-  console.log('   - No Pre-Validation: Delta Exchange handles balance checks');
-  console.log('   - Volume Types: volume, USD, equity_percent');
-  console.log('   - Order Types: MARKET, LIMIT');
-  console.log('   - Partial Exits: Works without reduce_only flag');
-  console.log('   - Full Exits: Uses reduce_only flag');
-  console.log('   - Actual Position Tracking: Real-time from Delta API');
-  console.log('   - Error Translation: Human-readable messages');
-  console.log('   - Graceful Skipping: No-position exits return success');
+  console.log('✅ ADVANCED FEATURES:');
+  console.log('   ✓ Stop Loss / Take Profit (SL/TP)');
+  console.log('   ✓ Wait for Position Confirmation');
+  console.log('   ✓ Advanced Order Types (IOC, GTC)');
+  console.log('   ✓ Post Only Orders');
+  console.log('   ✓ Reduce Only Orders');
+  console.log('   ✓ Trailing Stop Loss');
+  console.log('   ✓ Trigger Methods (mark_price, last_traded_price, spot_price)');
+  console.log('   ✓ Client Order ID');
+  console.log('   ✓ TP/SL Modes (level, pips, points, percent)');
+  console.log('   ✓ Bracket Orders');
   console.log('='.repeat(70) + '\n');
 });
